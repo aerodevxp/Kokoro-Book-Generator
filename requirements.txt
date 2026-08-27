@@ -12,3 +12,4 @@ pydub
 ffmpeg
 audioio
 audioop-lts
+streamlit
