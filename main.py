@@ -55,14 +55,14 @@ Workflow:
 File Structure:
 /books/
   ├── story.txt              # Generated stories (NO voice tags - main file)
-  ├── unclean_texts/         # Directory for unclean versions (with voice tags)
-  │   └── story_unclean.txt  # Version WITH voice tags (for TTS)
+  ├── clean_texts/           # Directory for clean versions
+  │   └── story_clean.txt    # Clean version for reference
   ├── worldbooks/            # World context files (.txt)
   ├── series/                # Organized story series
   │   └── SERIES_NAME/
   │       ├── book1.txt
-  │       └── unclean_texts/
-  │           └── book1_unclean.txt
+  │       └── clean_texts/
+  │           └── book1_clean.txt
   └── features.txt           # Available story features
 
 Commands:
@@ -193,14 +193,14 @@ def select_reference_story():
         if series_dir.is_dir():
             story_files.extend(list(series_dir.glob("*.txt")))
     
-    # Filter out metadata and files in unclean_texts directories
+    # Filter out metadata and files in clean_texts directories
     filtered_files = []
     for f in story_files:
         # Skip metadata files
         if f.name.endswith("_metadata.json"):
             continue
-        # Skip files in unclean_texts directories
-        if "unclean_texts" in str(f):
+        # Skip files in clean_texts directories
+        if "clean_texts" in str(f):
             continue
         filtered_files.append(f)
     story_files = filtered_files
@@ -233,7 +233,7 @@ def load_story_context(story_path):
     
     try:
         with open(story_path, 'r') as f:
-            content = f.read()[:1500]  # First 1500 chars for context
+            content = f.read() # First 1500 chars for context
             return f"Reference Story Context (from '{story_path.stem}'):\n{content}\n\n"
     except Exception as e:
         print(f"Error loading reference story: {e}")
@@ -270,7 +270,7 @@ def load_worldbook_context(worldbook_path):
     
     try:
         with open(worldbook_path, 'r') as f:
-            content = f.read()[:1000]  # First 1000 chars for context
+            content = f.read()
             return f"World Context (from '{worldbook_path.stem}'):\n{content}\n\n"
     except Exception as e:
         print(f"Error loading worldbook: {e}")
@@ -378,7 +378,7 @@ def extract_chapter_count(outline):
     print("No chapters detected, defaulting to 10")
     return 10
 
-def write_story(outline, total_chapters):
+def write_story(outline, total_chapters, worldbook_context, story_context):
     """Write the full story chapter by chapter without voice tags"""
     print(f"\n=== PHASE 2: WRITING STORY ({total_chapters} CHAPTERS) ===")
     base_prompt = read_base_prompt()
@@ -386,10 +386,14 @@ def write_story(outline, total_chapters):
 
     for chapter_num in range(1, total_chapters + 1):
         if chapter_num == 1:
-            prompt = f"{base_prompt}\n\nBased on this outline:\n{outline}\n\nWrite Chapter {chapter_num} in detail. Write dialogue naturally without adding any voice tags."
+            prompt = f"""{base_prompt}
+
+{worldbook_context}{story_context}Based on this outline:\n{outline}\n\nWrite Chapter {chapter_num} in detail. Write dialogue naturally without adding any voice tags."""
         else:
             prev_content = ' '.join(story_parts[-1:])  # Just previous chapter
-            prompt = f"{base_prompt}\n\nContinue the story from:\n{prev_content}\n\nWrite Chapter {chapter_num} in detail. Write dialogue naturally without adding any voice tags."
+            prompt = f"""{base_prompt}
+
+{worldbook_context}{story_context}Continue the story from:\n{prev_content}\n\nWrite Chapter {chapter_num} in detail. Write dialogue naturally without adding any voice tags."""
 
         # Always end chapter with [END]
         prompt += " End this chapter with [END]"
@@ -736,6 +740,7 @@ def main():
         # Select worldbook context
         worldbook_path = select_worldbook()
         worldbook_context = load_worldbook_context(worldbook_path)
+        print(f"Worldbook: {worldbook_path}\n{worldbook_context}")
         
         # Get features and length
         features = get_required_features()
@@ -744,7 +749,7 @@ def main():
         # Ask about TTS preference upfront
         want_tts = get_tts_preference()
 
-        # Generate outline
+        # Generate outline (passes worldbook_context)
         outline = generate_outline(
             topic, genre, features, 
             worldbook_context, story_context, 
@@ -754,8 +759,8 @@ def main():
         # Extract chapter count
         total_chapters = extract_chapter_count(outline)
 
-        # Write story
-        story = write_story(outline, total_chapters)
+        # Write story (passes worldbook_context)
+        story = write_story(outline, total_chapters, worldbook_context, story_context)
 
         # Extract title and save
         title = extract_title(outline)
