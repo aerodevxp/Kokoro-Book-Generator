@@ -12,7 +12,7 @@ from pydub import AudioSegment
 
 # Load environment variables
 load_dotenv()
- 
+
 # Configuration
 STORY_MODEL = os.getenv("STORY_MODEL")
 TITLE_MODEL = os.getenv("TITLE_MODEL")
@@ -258,15 +258,19 @@ def main():
     st.markdown("Generate stories with AI, complete with multi-voice TTS audiobook generation.")
 
     # Sidebar Navigation
-    menu = ["Generate New Story", "Generate TTS for Existing", "Create Worldbook", "Clean Existing Story"]
+    menu = ["Generate New Story", "Generate TTS for Existing", "Story Library", "Worldbook Manager", "Feature Manager", "Clean Existing Story"]
     choice = st.sidebar.selectbox("Menu", menu)
 
     if choice == "Generate New Story":
         generate_new_story_page()
     elif choice == "Generate TTS for Existing":
         generate_tts_existing_page()
-    elif choice == "Create Worldbook":
-        create_worldbook_page()
+    elif choice == "Story Library":
+        story_library_page()
+    elif choice == "Worldbook Manager":
+        worldbook_manager_page()
+    elif choice == "Feature Manager":
+        feature_manager_page()
     elif choice == "Clean Existing Story":
         clean_existing_story_page()
 
@@ -544,22 +548,90 @@ def generate_tts_existing_page():
         prog_bar = st.progress(0)
         generate_tts_from_text(story_content, selected_file.stem, selected_file.parent, status_ph, prog_bar)
 
-def create_worldbook_page():
-    st.header("Create New Worldbook")
-    name = st.text_input("Worldbook Name (filename)")
-    content = st.text_area("Worldbook Content", height=300)
+def story_library_page():
+    st.header("📚 Story Library")
+    stories = get_all_stories()
+    if not stories:
+        st.info("No stories found. Generate one first!")
+        return
     
-    if st.button("Save Worldbook", type="primary"):
-        if name and content:
-            worldbook_path = Path(WORLDBOOK_DIR) / f"{name}.txt"
-            with open(worldbook_path, 'w') as f:
-                f.write(content)
-            st.success(f"Worldbook saved: {worldbook_path}")
-        else:
-            st.error("Name and content are required.")
+    story_opts = [str(s.relative_to(Path(OUTPUT_DIR).parent)) for s in stories]
+    selected = st.selectbox("Select Story to View", story_opts)
+    
+    selected_file = next(s for s in stories if str(s.relative_to(Path(OUTPUT_DIR).parent)) == selected)
+    
+    with open(selected_file, 'r') as f:
+        story_content = f.read()
+    
+    st.subheader(selected_file.stem)
+    st.text_area("Content", story_content, height=500)
+    
+    # Check for audiobook
+    audiobook_path = selected_file.parent / f"{selected_file.stem}_audiobook.mp3"
+    if audiobook_path.exists():
+        st.subheader("🎙️ Audiobook")
+        st.audio(str(audiobook_path))
+        
+        with open(audiobook_path, "rb") as f:
+            st.download_button("Download Audiobook", f, file_name=f"{selected_file.stem}_audiobook.mp3", mime="audio/mpeg")
+
+def worldbook_manager_page():
+    st.header("🌍 Worldbook Manager")
+    
+    tab1, tab2 = st.tabs(["Create New", "Edit Existing"])
+    
+    with tab1:
+        st.subheader("Create New Worldbook")
+        name = st.text_input("Worldbook Name (filename)", key="new_wb_name")
+        content = st.text_area("Worldbook Content", height=300, key="new_wb_content")
+        
+        if st.button("Save Worldbook", type="primary", key="save_new_wb"):
+            if name and content:
+                worldbook_path = Path(WORLDBOOK_DIR) / f"{name}.txt"
+                with open(worldbook_path, 'w') as f:
+                    f.write(content)
+                st.success(f"Worldbook saved: {worldbook_path}")
+            else:
+                st.error("Name and content are required.")
+    
+    with tab2:
+        st.subheader("Edit Existing Worldbook")
+        worldbooks = get_worldbooks()
+        if not worldbooks:
+            st.info("No worldbooks found.")
+            return
+        
+        wb_opts = [wb.stem for wb in worldbooks]
+        selected_wb = st.selectbox("Select Worldbook", wb_opts, key="edit_wb_select")
+        
+        wb_path = next(wb for wb in worldbooks if wb.stem == selected_wb)
+        with open(wb_path, 'r') as f:
+            current_content = f.read()
+        
+        edited_content = st.text_area("Edit Content", current_content, height=300, key="edit_wb_content")
+        
+        if st.button("Update Worldbook", type="primary", key="update_wb"):
+            with open(wb_path, 'w') as f:
+                f.write(edited_content)
+            st.success(f"Worldbook updated: {wb_path}")
+
+def feature_manager_page():
+    st.header("✨ Feature Manager")
+    st.markdown("Edit the available story features. These will appear as checkboxes when generating a new story.")
+    
+    features = load_features()
+    features_str = "\n".join(features)
+    
+    edited_features = st.text_area("Features (one per line)", features_str, height=300)
+    
+    if st.button("Save Features", type="primary"):
+        new_features = [f.strip() for f in edited_features.split('\n') if f.strip()]
+        with open(FEATURES_FILE, 'w') as f:
+            f.write('\n'.join(new_features))
+        st.success(f"Features saved! {len(new_features)} features available.")
 
 def clean_existing_story_page():
-    st.header("Clean Existing Story (Remove Voice Tags)")
+    st.header("🧹 Clean Existing Story (Remove Voice Tags)")
     stories = get_all_stories()
     if not stories:
         st.warning("No stories found.")
