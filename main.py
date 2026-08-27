@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 import requests
 import sys
+import json
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -18,6 +19,9 @@ BASE_URL = os.getenv("BASE_URL")
 TTS_URL = os.getenv("TTS_URL")
 BASE_PROMPT_PATH = os.getenv("BASE_PROMPT_PATH")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR")
+WORLDBOOK_DIR = os.getenv("WORLDBOOK_DIR", os.path.join(OUTPUT_DIR, "worldbooks"))
+SERIES_DIR = os.getenv("SERIES_DIR", os.path.join(OUTPUT_DIR, "series"))
+FEATURES_FILE = os.getenv("FEATURES_FILE", os.path.join(OUTPUT_DIR, "features.txt"))
 
 # Precompiled regex patterns
 VOICE_PATTERN = re.compile(r"<(am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)*[^>]+>([^<]*)</\1*[^>]+>")
@@ -27,6 +31,45 @@ QUOTE_PATTERN = re.compile(r'(["“”])([^"“”]*)\1')  # Matches quoted text
 llm_client = openai.OpenAI(base_url=BASE_URL, api_key=os.getenv("LLM_API_KEY", "dummy-key"))
 tts_client = openai.OpenAI(base_url=TTS_URL, api_key=os.getenv("TTS_API_KEY", "not-needed"))
 
+def show_help():
+    """Display help information"""
+    help_text = """
+=== STORY GENERATOR HELP ===
+
+This script generates stories with the following features:
+- Customizable story parameters (topic, genre, length, features)
+- Series management (sequels/prequels)
+- Worldbook integration (contextual world information)
+- Automatic TTS generation
+- Metadata tracking
+
+Workflow:
+1. Topic & Genre: What the story is about
+2. Story Type: Standalone, sequel, or prequel
+3. References: Select existing books/worldbooks for context
+4. Features: Required story elements
+5. Length: Chapter count
+6. Generation: Outline → Story → Title
+7. Output: Save files, generate TTS
+
+File Structure:
+/books/
+  ├── story.txt              # Generated stories (NO voice tags - main file)
+  ├── story_unclean.txt      # Version WITH voice tags (for TTS)
+  ├── worldbooks/            # World context files (.txt)
+  ├── series/                # Organized story series
+  │   └── SERIES_NAME/
+  │       ├── book1.txt
+  │       └── book2.txt
+  └── features.txt           # Available story features
+
+Commands:
+  --show-help         Show this help
+  --tts-only          Generate TTS for existing story file
+  --create-worldbook  Create new worldbook interactively
+"""
+    print(help_text)
+
 def read_base_prompt():
     """Read the base prompt from file"""
     try:
@@ -34,6 +77,12 @@ def read_base_prompt():
             return f.read().strip()
     except FileNotFoundError:
         return ""
+
+def ensure_directories():
+    """Ensure all required directories exist"""
+    dirs = [OUTPUT_DIR, WORLDBOOK_DIR, SERIES_DIR]
+    for directory in dirs:
+        Path(directory).mkdir(parents=True, exist_ok=True)
 
 def show_spinner(label):
     """Show a simple spinner for ongoing processes"""
@@ -69,8 +118,36 @@ def stream_with_spinner(response, label):
         print(f"\nError during streaming: {e}")
         raise
 
+def load_features():
+    """Load available features from file"""
+    features = []
+    try:
+        with open(FEATURES_FILE, 'r') as f:
+            features = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        print(f"Features file not found: {FEATURES_FILE}")
+        # Create default features file
+        default_features = [
+            "Magic System",
+            "Political Intrigue",
+            "Romantic Subplot",
+            "Mystery Element",
+            "Action Sequences",
+            "Character Development",
+            "Philosophical Themes",
+            "Supernatural Elements",
+            "Technology Integration",
+            "Survival Elements"
+        ]
+        with open(FEATURES_FILE, 'w') as f:
+            f.write('\n'.join(default_features))
+        features = default_features
+        print(f"Created default features file: {FEATURES_FILE}")
+    
+    return features
+
 def get_user_input():
-    """Get story topic and length from user"""
+    """Get story topic and genre from user"""
     print("=== STORY GENERATOR ===")
 
     # Get story topic
@@ -78,7 +155,138 @@ def get_user_input():
     if not topic:
         topic = "a compelling story of your choice"
 
-    # Get story length
+    # Get genre as free text
+    genre = input("What genre should the story be? (leave blank for AI to decide): ").strip()
+    if not genre:
+        genre = "AI decides"
+    
+    print(f"Selected genre: {genre}")
+    return topic, genre
+
+def get_story_type():
+    """Determine if story is standalone, sequel, or prequel"""
+    print("\nStory type options:")
+    print("1. Standalone story")
+    print("2. Sequel to existing story")
+    print("3. Prequel to existing story")
+    
+    choice = input("Choose story type (1-3, default=1): ").strip()
+    
+    if choice == "2":
+        return "sequel"
+    elif choice == "3":
+        return "prequel"
+    else:
+        return "standalone"
+
+def select_reference_story():
+    """Allow user to select an existing story as reference"""
+    # Collect all story files
+    story_files = []
+    # Check main directory
+    story_files.extend(list(Path(OUTPUT_DIR).glob("*.txt")))
+    # Check series directories
+    for series_dir in Path(SERIES_DIR).iterdir():
+        if series_dir.is_dir():
+            story_files.extend(list(series_dir.glob("*.txt")))
+    
+    # Filter out metadata, unclean, and clean files
+    story_files = [f for f in story_files if not f.name.endswith("_metadata.json") and not f.name.endswith("_unclean.txt")]
+    
+    if not story_files:
+        print("No existing stories found.")
+        return None
+    
+    print("\nAvailable stories:")
+    for i, story in enumerate(story_files, 1):
+        rel_path = story.relative_to(Path(OUTPUT_DIR).parent)
+        print(f"{i}. {rel_path}")
+    
+    try:
+        choice = input("Select reference story (0 for none): ").strip()
+        if choice == "0" or not choice:
+            return None
+        index = int(choice) - 1
+        if 0 <= index < len(story_files):
+            return story_files[index]
+    except (ValueError, IndexError):
+        print("Invalid selection, proceeding without reference story")
+    
+    return None
+
+def load_story_context(story_path):
+    """Load story content for context injection"""
+    if not story_path:
+        return ""
+    
+    try:
+        with open(story_path, 'r') as f:
+            content = f.read()[:1500]  # First 1500 chars for context
+            return f"Reference Story Context (from '{story_path.stem}'):\n{content}\n\n"
+    except Exception as e:
+        print(f"Error loading reference story: {e}")
+        return ""
+
+def select_worldbook():
+    """Allow user to select a worldbook for context"""
+    worldbooks = list(Path(WORLDBOOK_DIR).glob("*.txt"))
+    
+    if not worldbooks:
+        print("No worldbooks found.")
+        return None
+    
+    print("\nAvailable worldbooks:")
+    for i, wb in enumerate(worldbooks, 1):
+        print(f"{i}. {wb.stem}")
+    
+    try:
+        choice = input("Select worldbook (0 for none): ").strip()
+        if choice == "0" or not choice:
+            return None
+        index = int(choice) - 1
+        if 0 <= index < len(worldbooks):
+            return worldbooks[index]
+    except (ValueError, IndexError):
+        print("Invalid selection, proceeding without worldbook")
+    
+    return None
+
+def load_worldbook_context(worldbook_path):
+    """Load worldbook content for context injection"""
+    if not worldbook_path:
+        return ""
+    
+    try:
+        with open(worldbook_path, 'r') as f:
+            content = f.read()[:1000]  # First 1000 chars for context
+            return f"World Context (from '{worldbook_path.stem}'):\n{content}\n\n"
+    except Exception as e:
+        print(f"Error loading worldbook: {e}")
+        return ""
+
+def get_required_features():
+    """Get required story features from user"""
+    features = load_features()
+    print("\nRequired story features (select multiple, comma-separated):")
+    for i, feature in enumerate(features, 1):
+        print(f"{i}. {feature}")
+    print(f"{len(features)+1}. None (AI chooses)")
+
+    feature_choices = input(f"Select features (1-{len(features)+1}, comma-separated): ").strip()
+    
+    selected_features = []
+    if feature_choices and feature_choices != str(len(features)+1):
+        try:
+            indices = [int(x.strip()) for x in feature_choices.split(',')]
+            selected_features = [features[i-1] for i in indices if 1 <= i <= len(features)]
+        except ValueError:
+            print("Invalid input, using no specific features")
+    
+    print(f"Selected features: {selected_features if selected_features else 'None'}")
+    return selected_features
+
+def get_story_length():
+    """Get story length from user"""
     print("\nStory length options:")
     print("1. Short (5-8 chapters)")
     print("2. Medium (10-15 chapters)")
@@ -97,12 +305,41 @@ def get_user_input():
     length_instruction = length_prompts.get(length_choice, length_prompts["4"])
     print(f"Selected: {length_instruction}")
 
-    return topic, length_instruction
+    return length_instruction
 
-def generate_outline(topic, length_instruction):
+def get_tts_preference():
+    """Ask user if they want TTS generation"""
+    choice = input("\nGenerate TTS for this story? (Y/n, default=Y): ").strip().lower()
+    if choice in ["n", "no"]:
+        return False
+    return True
+
+def generate_outline(topic, genre, features, worldbook_context, story_context, length_instruction, story_type):
     """Generate story outline with streaming"""
     base_prompt = read_base_prompt()
-    prompt = f"{base_prompt}\n\nGenerate a detailed story outline about {topic}. {length_instruction}. List each chapter with a brief description."
+    
+    # Build features instruction
+    features_instruction = ""
+    if features:
+        features_list = ", ".join(features)
+        features_instruction = f"The story MUST include these elements: {features_list}. "
+    
+    # Build story type instruction
+    type_instruction = ""
+    if story_type == "sequel":
+        type_instruction = "This is a SEQUEL - continue the story logically from previous events while introducing new conflicts."
+    elif story_type == "prequel":
+        type_instruction = "This is a PREQUEL - explore events leading up to referenced story with established characters/settings."
+    
+    prompt = f"""{base_prompt}
+
+{worldbook_context}{story_context}Generate a detailed story outline.
+Topic: {topic}
+Genre: {genre}
+{type_instruction}
+{features_instruction}
+Length requirement: {length_instruction}
+List each chapter with a brief description."""
 
     print("\n=== PHASE 1: GENERATING OUTLINE ===")
     response = llm_client.chat.completions.create(
@@ -171,10 +408,6 @@ def write_story(outline, total_chapters):
 
         response = llm_client.chat.completions.create(
             model=STORY_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2048,
-            temperature=0.8,
-            stream=True
         )
 
         chapter = stream_with_spinner(response, f"Writing chapter {chapter_num}/{total_chapters}")
@@ -220,21 +453,46 @@ def sanitize_title(title):
     safe_title = safe_title.rstrip('_')
     return safe_title or "Untitled-Story"
 
-def save_story(story, title):
-    """Save story to file"""
+def save_metadata(title, story_type, reference_story, worldbook_used, features_used, output_dir):
+    """Save metadata for the story"""
+    metadata = {
+        "title": title,
+        "story_type": story_type,
+        "reference_story": str(reference_story) if reference_story else None,
+        "worldbook": str(worldbook_used) if worldbook_used else None,
+        "features": features_used,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "output_dir": str(output_dir)
+    }
+    
+    metadata_file = output_dir / f"{sanitize_title(title)}_metadata.json"
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"Metadata saved: {metadata_file}")
+
+def save_story(story, title, series_name=None):
+    """Save story WITHOUT voice tags (main story file)"""
     # Sanitize title for filename
     safe_title = sanitize_title(title)
-    filename = f"{safe_title}.txt"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-
-    # Ensure directory exists
-    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-
+    
+    # Determine save location
+    if series_name:
+        save_dir = Path(SERIES_DIR) / series_name
+    else:
+        save_dir = Path(OUTPUT_DIR)
+    
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save clean version as main story file
+    clean_story = remove_voice_tags(story)
+    filepath = save_dir / f"{safe_title}.txt"
+    
     with open(filepath, 'w') as f:
-        f.write(story)
+        f.write(clean_story)
 
-    print(f"Story saved: {filepath}")
-    return filepath
+    print(f"Main story (no voice tags) saved: {filepath}")
+    return filepath, save_dir
 
 def remove_voice_tags(text):
     """Remove voice tags from text"""
@@ -242,24 +500,19 @@ def remove_voice_tags(text):
     clean_text = VOICE_PATTERN.sub(r'\2', text)
     return clean_text
 
-def save_clean_story(story, title):
-    """Save a clean version of the story without voice tags"""
+def save_unclean_story(story, title, series_save_dir):
+    """Save the unclean version WITH voice tags (for TTS)"""
     safe_title = sanitize_title(title)
-    clean_story = remove_voice_tags(story)
+    
+    # Save unclean version with tags
+    unclean_filename = f"{safe_title}_unclean.txt"
+    unclean_filepath = series_save_dir / unclean_filename
 
-    # Create tts_text subdirectory
-    tts_text_dir = os.path.join(OUTPUT_DIR, "tts_text")
-    Path(tts_text_dir).mkdir(parents=True, exist_ok=True)
+    with open(unclean_filepath, 'w') as f:
+        f.write(story)
 
-    # Save clean version
-    clean_filename = f"{safe_title}_clean.txt"
-    clean_filepath = os.path.join(tts_text_dir, clean_filename)
-
-    with open(clean_filepath, 'w') as f:
-        f.write(clean_story)
-
-    print(f"Clean story saved: {clean_filepath}")
-    return clean_filepath
+    print(f"Unclean story (with voice tags) saved: {unclean_filepath}")
+    return unclean_filepath
 
 def split_into_paragraphs(text):
     """Split text into paragraphs for better TTS granularity"""
@@ -305,7 +558,7 @@ def parse_tts_text(text):
 
     return segments
 
-def generate_tts_from_text(story_text, title):
+def generate_tts_from_text(story_text, title, series_save_dir):
     """Generate TTS for existing story text with paragraph-level processing"""
     print("\n=== GENERATING TTS FROM EXISTING TEXT ===")
 
@@ -314,8 +567,8 @@ def generate_tts_from_text(story_text, title):
 
     # Create output directory
     safe_title = sanitize_title(title)
-    tts_dir = os.path.join(OUTPUT_DIR, f"{safe_title}_tts")
-    Path(tts_dir).mkdir(parents=True, exist_ok=True)
+    tts_dir = series_save_dir / f"{safe_title}_tts"
+    tts_dir.mkdir(parents=True, exist_ok=True)
 
     if has_voice_tags:
         # Process with voice tags
@@ -363,9 +616,9 @@ def generate_tts_with_voice_tags(story_text, tts_dir):
                         voice=segment['voice'],
                         input=sentence
                     ) as response:
-                        audio_file = os.path.join(tts_dir, f"segment_{i:03d}_{j:02d}_{segment['voice']}.mp3")
-                        response.stream_to_file(audio_file)
-                        audio_files.append(audio_file)
+                        audio_file = tts_dir / f"segment_{i:03d}_{j:02d}_{segment['voice']}.mp3"
+                        response.stream_to_file(str(audio_file))
+                        audio_files.append(str(audio_file))
 
                 except Exception as e:
                     print(f"\nError generating TTS for segment {i} sentence {j}: {e}")
@@ -415,9 +668,9 @@ def generate_tts_without_voice_tags(story_text, tts_dir):
                         voice="af_heart",  # Default voice
                         input=sentence
                     ) as response:
-                        audio_file = os.path.join(tts_dir, f"paragraph_{i:04d}_sentence_{j:02d}_af_heart.mp3")
-                        response.stream_to_file(audio_file)
-                        audio_files.append(audio_file)
+                        audio_file = tts_dir / f"paragraph_{i:04d}_sentence_{j:02d}_af_heart.mp3"
+                        response.stream_to_file(str(audio_file))
+                        audio_files.append(str(audio_file))
 
                 except Exception as e:
                     print(f"\nError generating TTS for paragraph {i} sentence {j}: {e}")
@@ -436,30 +689,38 @@ def generate_tts_for_existing_file():
     """Generate TTS for an existing story file"""
     print("=== TTS GENERATOR FOR EXISTING FILES ===")
 
-    # List available story files
-    story_files = list(Path(OUTPUT_DIR).glob("*.txt"))
+    # List available story files (looking for unclean versions with voice tags)
+    story_files = []
+    # Main directory
+    story_files.extend([f for f in Path(OUTPUT_DIR).glob("*_unclean.txt")])
+    # Series directories
+    for series_dir in Path(SERIES_DIR).iterdir():
+        if series_dir.is_dir():
+            story_files.extend([f for f in series_dir.glob("*_unclean.txt")])
+    
     if not story_files:
-        print("No story files found!")
+        print("No unclean story files found!")
         return
 
-    print("Available story files:")
+    print("Available unclean story files (with voice tags):")
     for i, file in enumerate(story_files):
-        print(f"{i+1}. {file.name}")
+        rel_path = file.relative_to(Path(OUTPUT_DIR).parent)
+        print(f"{i+1}. {rel_path}")
 
     try:
         choice = int(input("Select file number: ")) - 1
         selected_file = story_files[choice]
 
-        # Read the story content
+        # Read the story content (WITH voice tags for proper TTS)
         with open(selected_file, 'r') as f:
             story_content = f.read()
 
-        # Use filename as title (without extension)
-        title = selected_file.stem
+        # Use filename as title (without _unclean.txt extension)
+        title = selected_file.stem.replace('_unclean', '')
         print(f"Generating TTS for: {title}")
 
         # Generate TTS
-        audio_files = generate_tts_from_text(story_content, title)
+        audio_files = generate_tts_from_text(story_content, title, selected_file.parent)
         print(f"TTS generation complete for {title}")
 
     except (ValueError, IndexError):
@@ -467,21 +728,84 @@ def generate_tts_for_existing_file():
     except Exception as e:
         print(f"Error: {e}")
 
+def create_worldbook_interactive():
+    """Interactive worldbook creation"""
+    print("=== CREATE NEW WORLDBOOK ===")
+    
+    name = input("Worldbook name (will be filename): ").strip()
+    if not name:
+        print("Name required!")
+        return
+    
+    print("Enter worldbook content (multiple lines, empty line to finish):")
+    lines = []
+    while True:
+        line = input()
+        if not line:
+            break
+        lines.append(line)
+    
+    content = '\n'.join(lines)
+    
+    worldbook_path = Path(WORLDBOOK_DIR) / f"{name}.txt"
+    with open(worldbook_path, 'w') as f:
+        f.write(content)
+    
+    print(f"Worldbook created: {worldbook_path}")
+
 def main():
-    parser = argparse.ArgumentParser(description='Story Generator with TTS')
+    parser = argparse.ArgumentParser(description='Enhanced Story Generator with Series & Worldbooks')
     parser.add_argument('--tts-only', action='store_true', help='Generate TTS for existing story file')
+    parser.add_argument('--create-worldbook', action='store_true', help='Create a new worldbook')
+    parser.add_argument('--show-help', action='store_true', help='Show help information')
     args = parser.parse_args()
 
+    # Handle help flag
+    if args.show_help:
+        show_help()
+        return
+
+    # Ensure directories exist
+    ensure_directories()
+
+    if args.create_worldbook:
+        create_worldbook_interactive()
+        return
+        
     if args.tts_only:
         generate_tts_for_existing_file()
         return
 
     try:
         # Get user input
-        topic, length_instruction = get_user_input()
+        topic, genre = get_user_input()
+        story_type = get_story_type()
+        
+        # Get reference story if needed
+        reference_story = None
+        if story_type in ["sequel", "prequel"]:
+            reference_story = select_reference_story()
+        
+        # Load story context
+        story_context = load_story_context(reference_story)
+        
+        # Select worldbook context
+        worldbook_path = select_worldbook()
+        worldbook_context = load_worldbook_context(worldbook_path)
+        
+        # Get features and length
+        features = get_required_features()
+        length_instruction = get_story_length()
+        
+        # Ask about TTS preference upfront
+        want_tts = get_tts_preference()
 
         # Generate outline
-        outline = generate_outline(topic, length_instruction)
+        outline = generate_outline(
+            topic, genre, features, 
+            worldbook_context, story_context, 
+            length_instruction, story_type
+        )
 
         # Extract chapter count
         total_chapters = extract_chapter_count(outline)
@@ -491,18 +815,29 @@ def main():
 
         # Extract title and save
         title = extract_title(outline)
-        filepath = save_story(story, title)
+        
+        # For sequels/prequels, save in same series as reference
+        series_name = None
+        if story_type in ["sequel", "prequel"] and reference_story:
+            ref_parent = reference_story.parent
+            if ref_parent != Path(OUTPUT_DIR):
+                series_name = ref_parent.name
+        
+        filepath, save_dir = save_story(story, title, series_name)
+        
+        # Save unclean version with voice tags for TTS
+        unclean_filepath = save_unclean_story(outline, title, save_dir)  # Using outline since that's where voice tags are
 
-        # Save clean version for TTS
-        clean_filepath = save_clean_story(story, title)
+        # Save metadata
+        save_metadata(title, story_type, reference_story, worldbook_path, features, save_dir)
 
-        # Offer to generate TTS
-        if input("\nGenerate TTS now? (y/n): ").lower().startswith('y'):
-            generate_tts_from_text(story, title)
+        # Generate TTS if requested - now uses the unclean version
+        if want_tts:
+            generate_tts_from_text(outline, title, save_dir)  # Use outline (with tags) for TTS
 
         print(f"\n🎉 Process completed successfully!")
-        print(f"📖 Story: {filepath}")
-        print(f"📄 Clean text: {clean_filepath}")
+        print(f"📖 Main story (no tags): {filepath}")
+        print(f"📄 Unclean story (with tags): {unclean_filepath}")
 
     except KeyboardInterrupt:
         print("\n\nProcess interrupted by user")
