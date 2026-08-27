@@ -24,7 +24,7 @@ SERIES_DIR = os.getenv("SERIES_DIR", os.path.join(OUTPUT_DIR, "series"))
 FEATURES_FILE = os.getenv("FEATURES_FILE", os.path.join(OUTPUT_DIR, "features.txt"))
 
 # Precompiled regex patterns
-VOICE_PATTERN = re.compile(r"<(am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)*[^>]+>([^<]*)</\1*[^>]+>")
+VOICE_PATTERN = re.compile(r"<(am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)[^>]*>([^<]*)</\1[^>]*>")
 QUOTE_PATTERN = re.compile(r'(["“”])([^"“”]*)\1')  # Matches quoted text
 
 # Initialize OpenAI clients
@@ -69,6 +69,7 @@ Commands:
   --show-help         Show this help
   --tts-only          Generate TTS for existing story file
   --create-worldbook  Create new worldbook interactively
+  --clean-story       Remove voice tags from existing story file
 """
     print(help_text)
 
@@ -377,42 +378,18 @@ def extract_chapter_count(outline):
     print("No chapters detected, defaulting to 10")
     return 10
 
-def add_missing_voice_tags(text):
-    """Add voice tags to quoted dialogue that's missing them"""
-    print("Post-processing: Adding missing voice tags...")
-
-    # Find quoted text that isn't already in voice tags
-    def replace_quotes(match):
-        quote_content = match.group(2).strip()
-        if quote_content:
-            # Wrap in default voice tag
-            return f'<af_heart>{quote_content}</af_heart>'
-        return match.group(0)
-
-    # Replace unmatched quotes with voice tags
-    processed_text = QUOTE_PATTERN.sub(replace_quotes, text)
-
-    # Count added tags
-    original_quotes = len(QUOTE_PATTERN.findall(text))
-    voice_tagged = len(VOICE_PATTERN.findall(processed_text))
-
-    if voice_tagged > 0:
-        print(f"Added voice tags to {voice_tagged} dialogue segments")
-
-    return processed_text
-
 def write_story(outline, total_chapters):
-    """Write the full story chapter by chapter with enforced voice tags"""
+    """Write the full story chapter by chapter without voice tags"""
     print(f"\n=== PHASE 2: WRITING STORY ({total_chapters} CHAPTERS) ===")
     base_prompt = read_base_prompt()
     story_parts = []
 
     for chapter_num in range(1, total_chapters + 1):
         if chapter_num == 1:
-            prompt = f"{base_prompt}\n\nBased on this outline:\n{outline}\n\nWrite Chapter {chapter_num} in detail. CRITICALLY IMPORTANT: Include dialogue with voice tags like <af_nicole>dialogue</af_nicole> OR <am_david>dialogue</am_david> for ALL character dialogue. EVERY piece of dialogue MUST have voice tags. Use different voices for different characters consistently."
+            prompt = f"{base_prompt}\n\nBased on this outline:\n{outline}\n\nWrite Chapter {chapter_num} in detail. Write dialogue naturally without adding any voice tags."
         else:
             prev_content = ' '.join(story_parts[-1:])  # Just previous chapter
-            prompt = f"{base_prompt}\n\nContinue the story from:\n{prev_content}\n\nWrite Chapter {chapter_num} in detail. CRITICALLY IMPORTANT: Include dialogue with voice tags like <af_nicole>dialogue</af_nicole> OR <am_david>dialogue</am_david> for ALL character dialogue. EVERY piece of dialogue MUST have voice tags. Use different voices for different characters consistently."
+            prompt = f"{base_prompt}\n\nContinue the story from:\n{prev_content}\n\nWrite Chapter {chapter_num} in detail. Write dialogue naturally without adding any voice tags."
 
         # Always end chapter with [END]
         prompt += " End this chapter with [END]"
@@ -426,15 +403,8 @@ def write_story(outline, total_chapters):
         )
 
         chapter = stream_with_spinner(response, f"Writing chapter {chapter_num}/{total_chapters}")
-
-        # Post-process to add missing voice tags
-        chapter_with_tags = add_missing_voice_tags(chapter)
-        story_parts.append(chapter_with_tags)
+        story_parts.append(chapter)
         print(f"Chapter {chapter_num}: Completed\n")
-
-        # Debug: Check if chapter has voice tags
-        if not VOICE_PATTERN.search(chapter_with_tags):
-            print(f"⚠  WARNING: Chapter {chapter_num} still missing voice tags!")
 
     return "\n\n".join(story_parts)
 
@@ -487,7 +457,7 @@ def save_metadata(title, story_type, reference_story, worldbook_used, features_u
     print(f"Metadata saved: {metadata_file}")
 
 def save_story(story, title, series_name=None):
-    """Save story WITHOUT voice tags (main story file)"""
+    """Save story as main story file"""
     # Sanitize title for filename
     safe_title = sanitize_title(title)
     
@@ -499,14 +469,13 @@ def save_story(story, title, series_name=None):
     
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save clean version as main story file
-    clean_story = remove_voice_tags(story)
+    # Save as main story file
     filepath = save_dir / f"{safe_title}.txt"
     
     with open(filepath, 'w') as f:
-        f.write(clean_story)
+        f.write(story)
 
-    print(f"Main story (no voice tags) saved: {filepath}")
+    print(f"Main story saved: {filepath}")
     return filepath, save_dir
 
 def remove_voice_tags(text):
@@ -515,23 +484,24 @@ def remove_voice_tags(text):
     clean_text = VOICE_PATTERN.sub(r'\2', text)
     return clean_text
 
-def save_unclean_story(story, title, series_save_dir):
-    """Save the unclean version WITH voice tags (for TTS) in unclean_texts subdirectory"""
+def save_clean_story(story, title, series_save_dir):
+    """Save a clean version of the story without voice tags"""
     safe_title = sanitize_title(title)
-    
-    # Create unclean_texts subdirectory
-    unclean_dir = series_save_dir / "unclean_texts"
-    unclean_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save unclean version with tags
-    unclean_filename = f"{safe_title}_unclean.txt"
-    unclean_filepath = unclean_dir / unclean_filename
+    clean_story = remove_voice_tags(story)
 
-    with open(unclean_filepath, 'w') as f:
-        f.write(story)
+    # Create clean_texts subdirectory
+    clean_dir = series_save_dir / "clean_texts"
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save clean version
+    clean_filename = f"{safe_title}_clean.txt"
+    clean_filepath = clean_dir / clean_filename
 
-    print(f"Unclean story (with voice tags) saved: {unclean_filepath}")
-    return unclean_filepath
+    with open(clean_filepath, 'w') as f:
+        f.write(clean_story)
+
+    print(f"Clean story saved: {clean_filepath}")
+    return clean_filepath
 
 def split_into_paragraphs(text):
     """Split text into paragraphs for better TTS granularity"""
@@ -539,115 +509,18 @@ def split_into_paragraphs(text):
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     return paragraphs
 
-def parse_tts_text(text):
-    """Parse text and extract voice segments"""
-    segments = []
-    last_end = 0
-
-    matches = list(VOICE_PATTERN.finditer(text))
-
-    for match in matches:
-        # Add default voice segment before this match
-        if match.start() > last_end:
-            default_text = text[last_end:match.start()].strip()
-            if default_text:
-                segments.append({
-                    'voice': 'af_heart',
-                    'text': default_text
-                })
-
-        # Add matched voice segment
-        voice_tag = match.group(0)
-        voice = voice_tag[1:voice_tag.find('>')]
-        content = match.group(2)
-        segments.append({
-            'voice': voice,
-            'text': content.strip()
-        })
-        last_end = match.end()
-
-    # Add remaining text with default voice
-    if last_end < len(text):
-        remaining_text = text[last_end:].strip()
-        if remaining_text:
-            segments.append({
-                'voice': 'af_heart',
-                'text': remaining_text
-            })
-
-    return segments
-
 def generate_tts_from_text(story_text, title, series_save_dir):
     """Generate TTS for existing story text with paragraph-level processing"""
     print("\n=== GENERATING TTS FROM EXISTING TEXT ===")
-
-    # First check if story has voice tags
-    has_voice_tags = bool(VOICE_PATTERN.search(story_text))
 
     # Create output directory
     safe_title = sanitize_title(title)
     tts_dir = series_save_dir / f"{safe_title}_tts"
     tts_dir.mkdir(parents=True, exist_ok=True)
 
-    if has_voice_tags:
-        # Process with voice tags
-        print("Found voice tags in story, processing segments...")
-        return generate_tts_with_voice_tags(story_text, tts_dir)
-    else:
-        # Process without voice tags (paragraph by paragraph)
-        print("No voice tags found, processing paragraph by paragraph...")
-        return generate_tts_without_voice_tags(story_text, tts_dir)
-
-def generate_tts_with_voice_tags(story_text, tts_dir):
-    """Generate TTS for text that has voice tags"""
-    # Parse text into voice segments
-    segments = parse_tts_text(story_text)
-
-    if not segments:
-        print("No TTS segments found!")
-        return []
-
-    print(f"Generating TTS for {len(segments)} voice segments...")
-    audio_files = []
-
-    # Process each voice segment
-    for i, segment in enumerate(segments):
-        if not segment['text'].strip():
-            continue
-
-        try:
-            # Show progress
-            progress_percent = ((i + 1) / len(segments)) * 100
-            print(f"\rTTS Generation: {progress_percent:.1f}% ({i + 1}/{len(segments)})", end="", flush=True)
-
-            # Split long segments into sentences for better progress
-            sentences = re.split(r'[.!?]+', segment['text'])
-            sentences = [s.strip() for s in sentences if s.strip()]
-
-            # Generate TTS for each sentence
-            for j, sentence in enumerate(sentences):
-                if not sentence.strip():
-                    continue
-
-                try:
-                    with tts_client.audio.speech.with_streaming_response.create(
-                        model="kokoro",
-                        voice=segment['voice'],
-                        input=sentence
-                    ) as response:
-                        audio_file = tts_dir / f"segment_{i:03d}_{j:02d}_{segment['voice']}.mp3"
-                        response.stream_to_file(str(audio_file))
-                        audio_files.append(str(audio_file))
-
-                except Exception as e:
-                    print(f"\nError generating TTS for segment {i} sentence {j}: {e}")
-
-        except Exception as e:
-            print(f"\nError generating TTS for segment {i}: {e}")
-
-    print(f"\rTTS Generation: 100.0% ({len(segments)}/{len(segments)}) - Complete!")
-    print(f"\nTTS generation complete. {len(audio_files)} files saved to: {tts_dir}")
-    return audio_files
+    # Process without voice tags (paragraph by paragraph)
+    print("Processing paragraph by paragraph...")
+    return generate_tts_without_voice_tags(story_text, tts_dir)
 
 def generate_tts_without_voice_tags(story_text, tts_dir):
     """Generate TTS for text without voice tags (paragraph by paragraph)"""
@@ -708,43 +581,86 @@ def generate_tts_for_existing_file():
     """Generate TTS for an existing story file"""
     print("=== TTS GENERATOR FOR EXISTING FILES ===")
 
-    # List available story files (looking for unclean versions with voice tags)
-    unclean_files = []
+    # List available story files
+    story_files = []
     # Main directory
-    main_unclean_dir = Path(OUTPUT_DIR) / "unclean_texts"
-    if main_unclean_dir.exists():
-        unclean_files.extend(list(main_unclean_dir.glob("*_unclean.txt")))
+    story_files.extend([f for f in Path(OUTPUT_DIR).glob("*.txt") if not f.name.endswith("_metadata.json")])
     # Series directories
     for series_dir in Path(SERIES_DIR).iterdir():
         if series_dir.is_dir():
-            series_unclean_dir = series_dir / "unclean_texts"
-            if series_unclean_dir.exists():
-                unclean_files.extend(list(series_unclean_dir.glob("*_unclean.txt")))
+            story_files.extend([f for f in series_dir.glob("*.txt") if not f.name.endswith("_metadata.json")])
     
-    if not unclean_files:
-        print("No unclean story files found!")
+    if not story_files:
+        print("No story files found!")
         return
 
-    print("Available unclean story files (with voice tags):")
-    for i, file in enumerate(unclean_files):
+    print("Available story files:")
+    for i, file in enumerate(story_files):
         rel_path = file.relative_to(Path(OUTPUT_DIR).parent)
         print(f"{i+1}. {rel_path}")
 
     try:
         choice = int(input("Select file number: ")) - 1
-        selected_file = unclean_files[choice]
+        selected_file = story_files[choice]
 
-        # Read the story content (WITH voice tags for proper TTS)
+        # Read the story content
         with open(selected_file, 'r') as f:
             story_content = f.read()
 
-        # Use filename as title (without _unclean.txt extension)
-        title = selected_file.stem.replace('_unclean', '')
+        # Use filename as title (without extension)
+        title = selected_file.stem
         print(f"Generating TTS for: {title}")
 
         # Generate TTS
-        audio_files = generate_tts_from_text(story_content, title, selected_file.parent.parent)
+        audio_files = generate_tts_from_text(story_content, title, selected_file.parent)
         print(f"TTS generation complete for {title}")
+
+    except (ValueError, IndexError):
+        print("Invalid selection")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def clean_story_file():
+    """Remove voice tags from an existing story file"""
+    print("=== CLEAN STORY FILE ===")
+
+    # List available story files
+    story_files = []
+    # Main directory
+    story_files.extend([f for f in Path(OUTPUT_DIR).glob("*.txt") if not f.name.endswith("_metadata.json")])
+    # Series directories
+    for series_dir in Path(SERIES_DIR).iterdir():
+        if series_dir.is_dir():
+            story_files.extend([f for f in series_dir.glob("*.txt") if not f.name.endswith("_metadata.json")])
+    
+    if not story_files:
+        print("No story files found!")
+        return
+
+    print("Available story files:")
+    for i, file in enumerate(story_files):
+        rel_path = file.relative_to(Path(OUTPUT_DIR).parent)
+        print(f"{i+1}. {rel_path}")
+
+    try:
+        choice = int(input("Select file number to clean: ")) - 1
+        selected_file = story_files[choice]
+
+        # Read the story content
+        with open(selected_file, 'r') as f:
+            story_content = f.read()
+
+        # Remove voice tags
+        clean_content = remove_voice_tags(story_content)
+
+        # Save cleaned version
+        clean_filename = f"{selected_file.stem}_cleaned{selected_file.suffix}"
+        clean_filepath = selected_file.parent / clean_filename
+
+        with open(clean_filepath, 'w') as f:
+            f.write(clean_content)
+
+        print(f"Cleaned story saved: {clean_filepath}")
 
     except (ValueError, IndexError):
         print("Invalid selection")
@@ -781,6 +697,7 @@ def main():
     parser.add_argument('--tts-only', action='store_true', help='Generate TTS for existing story file')
     parser.add_argument('--create-worldbook', action='store_true', help='Create a new worldbook')
     parser.add_argument('--show-help', action='store_true', help='Show help information')
+    parser.add_argument('--clean-story', action='store_true', help='Remove voice tags from existing story file')
     args = parser.parse_args()
 
     # Handle help flag
@@ -797,6 +714,10 @@ def main():
         
     if args.tts_only:
         generate_tts_for_existing_file()
+        return
+
+    if args.clean_story:
+        clean_story_file()
         return
 
     try:
@@ -848,19 +769,19 @@ def main():
         
         filepath, save_dir = save_story(story, title, series_name)
         
-        # Save unclean version with voice tags for TTS in unclean_texts subdirectory
-        unclean_filepath = save_unclean_story(story, title, save_dir)
+        # Save clean version 
+        clean_filepath = save_clean_story(story, title, save_dir)
 
         # Save metadata
         save_metadata(title, story_type, reference_story, worldbook_path, features, save_dir)
 
-        # Generate TTS if requested - now uses the unclean version
+        # Generate TTS if requested
         if want_tts:
-            generate_tts_from_text(story, title, save_dir)  # Use story with tags for TTS
+            generate_tts_from_text(story, title, save_dir)  # Use story for TTS
 
         print(f"\n🎉 Process completed successfully!")
-        print(f"📖 Main story (no tags): {filepath}")
-        print(f"📄 Unclean story (with tags): {unclean_filepath}")
+        print(f"📖 Main story: {filepath}")
+        print(f"📄 Clean story: {clean_filepath}")
 
     except KeyboardInterrupt:
         print("\n\nProcess interrupted by user")
