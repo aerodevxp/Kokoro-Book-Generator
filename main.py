@@ -494,11 +494,11 @@ def save_clean_story(story, title, series_save_dir):
     clean_story = remove_voice_tags(story)
 
     # Create clean_texts subdirectory
-    clean_dir = series_save_dir / "clean_texts"
+    clean_dir = series_save_dir
     clean_dir.mkdir(parents=True, exist_ok=True)
     
     # Save clean version
-    clean_filename = f"{safe_title}_clean.txt"
+    clean_filename = f"{safe_title}.txt"
     clean_filepath = clean_dir / clean_filename
 
     with open(clean_filepath, 'w') as f:
@@ -774,8 +774,8 @@ def main():
         
         filepath, save_dir = save_story(story, title, series_name)
         
-        # Save clean version 
-        clean_filepath = save_clean_story(story, title, save_dir)
+        # Save clean version without tts stuff 
+        #clean_filepath = save_clean_story(story, title, save_dir)
 
         # Save metadata
         save_metadata(title, story_type, reference_story, worldbook_path, features, save_dir)
