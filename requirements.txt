@@ -7,3 +7,8 @@ time
 requests
 sys
 dotenv
+spire.doc
+pydub
+ffmpeg
+audioio
+audioop-lts
