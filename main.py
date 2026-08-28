@@ -705,9 +705,19 @@ def update_worldbook_series_link(worldbook_path, series_name):
 
 # --- Job Status Functions ---
 
-def update_job_status(job_id, status, progress=0, message="", files=None, title=None, job_type="story"):
+def update_job_status(job_id, status, progress=0, message="", files=None, title=None, job_type="story", errors=None, params=None):
     """Update job status file"""
     status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+    
+    # If file exists and params is None, preserve existing params
+    if params is None and status_file.exists():
+        try:
+            with open(status_file, 'r') as f:
+                old_data = json.load(f)
+                params = old_data.get('params')
+        except:
+            pass
+
     with open(status_file, 'w') as f:
         json.dump({
             "job_id": job_id,
@@ -717,6 +727,8 @@ def update_job_status(job_id, status, progress=0, message="", files=None, title=
             "message": message,
             "files": files or [],
             "title": title,
+            "errors": errors or [],
+            "params": params,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }, f, indent=2)
 
@@ -796,7 +808,7 @@ def request_cancel(job_id):
 # --- Background Workers ---
 
 
-def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode):
+def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False):
     """Background worker for story generation"""
     cleanup_old_jobs(keep_last=3)
     try:
@@ -805,7 +817,25 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
                 update_job_status(job_id, "error", 0, "Generation cancelled by user")
                 return True
             return False
-        update_job_status(job_id, "running", 0, "Starting generation...", job_type="story")
+        # Validate inputs
+        if not topic or not topic.strip():
+            topic = "a compelling story of your choice"
+        if not genre or not genre.strip():
+            genre = "AI decides"
+        
+        if quick_test:
+            length_instruction = "Write EXACTLY ONE chapter. Do not write more than 1 chapter."
+            if topic == "a compelling story of your choice":
+                topic = "a very short story about a robot learning to paint"
+            update_job_status(job_id, "running", 0, "Quick Test Mode: Generating 1 chapter...")
+        params = {
+            "topic": topic, "genre": genre, "story_type": story_type,
+            "reference_story": str(reference_story) if reference_story else None,
+            "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
+            "features": features, "length_instruction": length_instruction,
+            "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test
+        }
+        update_job_status(job_id, "running", 0, "Starting generation...", job_type="story", params=params)
         base_prompt = read_base_prompt()
         
         character_voices = {}
@@ -823,6 +853,11 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             title = "Debug Test Story"
             update_job_status(job_id, "running", 0.1, "Debug mode: Loaded test story.", title=title)
         else:
+            if quick_test:
+                length_instruction = "Write EXACTLY ONE chapter. Do not write more than 1 chapter."
+                if topic == "a compelling story of your choice":
+                    topic = "a very short story about a robot learning to paint"
+                update_job_status(job_id, "running", 0, "Quick Test Mode: Generating 1 chapter...")
             # Phase 1: Outline
             update_job_status(job_id, "running", 0, "Phase 1: Generating Outline...")
             features_instruction = f"The story MUST include these elements: {', '.join(features)}. " if features else ""
@@ -859,9 +894,11 @@ List each chapter with a brief description."""
                             update_job_status(job_id, "running", min(0.05, token_count / 1000), f"Phase 1: Generating Outline... {token_count} tokens")
             
             update_job_status(job_id, "running", 0.1, f"Phase 1: Outline Complete ({token_count} tokens)")
-
             chapter_matches = re.findall(r'(?:Chapter|chapter)\s+(\d+)', outline, re.IGNORECASE)
-            total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
+            if quick_test:
+                total_chapters = 1
+            else:         
+                total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
             update_job_status(job_id, "running", 0.1, f"Detected {total_chapters} chapters. Starting Phase 2...")
 
             # Phase 2: Write Story
@@ -911,10 +948,6 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                 chapter_summary = generate_chapter_summary(chapter, chapter_num, job_id)
                 chapter_summaries.append(chapter_summary)
 
-                summaries_path = story_dir / f"{sanitize_title(title)}_chapter_summaries.json"
-                with open(summaries_path, 'w') as f:
-                    json.dump(chapter_summaries, f, indent=2)
-
                 chapter_progress = 0.1 + chapter_num / total_chapters * 0.7
                 update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}/{total_chapters} Completed ({ch_tokens} tokens)")
             
@@ -941,10 +974,7 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                 title = "Untitled-Story"
             update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
 
-            if chapter_summaries and not debug_mode:
-                update_job_status(job_id, "running", 0.92, "Generating book summary from chapter summaries...")
-                book_summary = generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id)
-                update_job_status(job_id, "running", 0.93, "Book summary generated!")
+            
 
         # Save Files
         update_job_status(job_id, "running", 0.9, "Saving files...", title=title)
@@ -952,6 +982,16 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
         tts_filepath = save_tts_story(story, title, story_dir)
         voices_used = extract_voices_used(story)
         save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used)
+
+        if chapter_summaries and not debug_mode:
+            summaries_path = story_dir / f"{sanitize_title(title)}_chapter_summaries.json"
+            with open(summaries_path, 'w') as f:
+                json.dump(chapter_summaries, f, indent=2)
+
+        if chapter_summaries and not debug_mode:
+                update_job_status(job_id, "running", 0.92, "Generating book summary from chapter summaries...")
+                book_summary = generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id)
+                update_job_status(job_id, "running", 0.93, "Book summary generated!")
         
         if series_name:
             add_story_to_series(series_name, title, story_type, reference_story, filepath,
@@ -976,7 +1016,9 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
 def run_tts_worker(job_id, story_path):
     """Background worker for TTS-only generation"""
     try:
-        update_job_status(job_id, "running", 0, "Loading story...", job_type="tts")
+        params = {"story_path": str(story_path)}
+        update_job_status(job_id, "running", 0, "Loading story...", job_type="tts", params=params)
+    
         
         tts_path = story_path.parent / f"{story_path.stem}_tts.txt"
         if tts_path.exists():
@@ -999,7 +1041,9 @@ def run_tts_worker(job_id, story_path):
 def run_clean_worker(job_id, story_path):
     """Background worker for cleaning voice tags"""
     try:
-        update_job_status(job_id, "running", 0, "Loading story...", job_type="clean")
+        params = {"story_path": str(story_path)}
+        update_job_status(job_id, "running", 0, "Loading story...", job_type="clean", params=params)
+       
         
         with open(story_path, 'r') as f:
             story_content = f.read()
@@ -1330,10 +1374,32 @@ def generate_new_story_page():
                 return
             elif job['status'] == 'error':
                 st.error(f"❌ **Last Job Failed:** {job['message']}")
-                if st.button("Clear Error"):
-                    delete_job(st.session_state['current_job_id'])
-                    del st.session_state['current_job_id']
-                    st.rerun()
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🔄 Retry"):
+                        params = job.get('params', {})
+                        new_job_id = str(int(time.time()))
+                        
+                        ref_story = Path(params['reference_story']) if params.get('reference_story') else None
+                        wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
+                        
+                        thread = threading.Thread(
+                            target=run_generation_worker,
+                            args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
+                                  ref_story, params.get('series_name'), wb_path, params.get('features', []), 
+                                  params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False))
+                        )
+                        thread.daemon = True
+                        thread.start()
+                        
+                        delete_job(st.session_state['current_job_id'])
+                        st.session_state['current_job_id'] = new_job_id
+                        st.rerun()
+                with col2:
+                    if st.button("Clear Error"):
+                        delete_job(st.session_state['current_job_id'])
+                        del st.session_state['current_job_id']
+                        st.rerun()
                 return
     
     col1, col2 = st.columns(2)
@@ -1411,15 +1477,17 @@ def generate_new_story_page():
         length_instruction = length_opts[length_choice]
         
         want_tts = st.checkbox("Generate TTS Audiobook", value=True)
-        debug_mode = st.checkbox("Debug Mode (Use Test Story, skip AI)")
+        gen_mode = st.selectbox("Generation Mode", ["Normal", "Quick Test (1 Chapter)", "Debug (Test Story)"])
+        debug_mode = (gen_mode == "Debug (Test Story)")
+        quick_test = (gen_mode == "Quick Test (1 Chapter)")
     
     if st.button("🚀 Generate Story", type="primary"):
         job_id = str(int(time.time()))
         
         thread = threading.Thread(
             target=run_generation_worker,
-            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode)
-        )
+            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode, quick_test)
+        ) 
         thread.daemon = True
         thread.start()
         
@@ -1575,7 +1643,8 @@ def generate_tts_existing_page():
 def run_summary_worker(job_id, story_path):
     """Background worker for generating a book summary"""
     try:
-        update_job_status(job_id, "running", 0, "Loading story for summary...", job_type="summary")
+        params = {"story_path": str(story_path)}
+        update_job_status(job_id, "running", 0, "Loading story for summary...", job_type="summary", params=params)
         summary = generate_story_summary(story_path, job_id)
         summary_path = story_path.parent / f"{story_path.stem}_summary.txt"
         update_job_status(job_id, "completed", 1.0, "Summary generated successfully!", [str(summary_path)], story_path.stem, job_type="summary")
@@ -1857,11 +1926,59 @@ def clean_existing_story_page():
                     st.rerun()
                 return
             elif job['status'] == 'error':
-                st.error(f"❌ **Job Failed:** {job['message']}")
-                if st.button("Clear Error"):
-                    delete_job(st.session_state['current_clean_job_id'])
-                    del st.session_state['current_clean_job_id']
-                    st.rerun()
+                st.error(f"❌ Error: {job['message']}")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button(f"🔄 Retry Job", key=f"retry_{job_id}"):
+                        # Start new job with old params
+                        new_job_id = str(int(time.time()))
+                        params = job.get('params', {})
+                        
+                        if job['job_type'] == 'story':
+                            ref_story = Path(params['reference_story']) if params.get('reference_story') else None
+                            wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
+                            
+                            thread = threading.Thread(
+                                target=run_generation_worker,
+                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
+                                      ref_story, params.get('series_name'), wb_path, params.get('features', []), 
+                                      params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_job_id'] = new_job_id
+                            
+                        elif job['job_type'] == 'tts':
+                            story_path = Path(params['story_path'])
+                            thread = threading.Thread(target=run_tts_worker, args=(new_job_id, story_path))
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_tts_job_id'] = new_job_id
+                            
+                        elif job['job_type'] == 'clean':
+                            story_path = Path(params['story_path'])
+                            thread = threading.Thread(target=run_clean_worker, args=(new_job_id, story_path))
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_clean_job_id'] = new_job_id
+                            
+                        elif job['job_type'] == 'summary':
+                            story_path = Path(params['story_path'])
+                            thread = threading.Thread(target=run_summary_worker, args=(new_job_id, story_path))
+                            thread.daemon = True
+                            thread.start()
+                            
+                        # Delete the old failed job
+                        delete_job(job_id)
+                        st.success(f"✅ Retrying job as {new_job_id}")
+                        time.sleep(2)
+                        st.rerun()
+                
+                with col2:
+                    if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
+                        delete_job(job_id)
+                        st.rerun()
                 return
     
     stories = get_all_stories()
