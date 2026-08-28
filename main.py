@@ -102,8 +102,8 @@ TEST_STORY = """The server room hummed with a steady, mechanical rhythm. [pause:
 
 @st.cache_resource
 def get_clients():
-    llm = openai.OpenAI(base_url=BASE_URL, api_key=os.getenv("LLM_API_KEY", "dummy-key"))
-    tts = openai.OpenAI(base_url=TTS_URL, api_key=os.getenv("TTS_API_KEY", "not-needed"))
+    llm = openai.OpenAI(base_url=BASE_URL, api_key=os.getenv("LLM_API_KEY", "dummy-key"), timeout=1800.0)
+    tts = openai.OpenAI(base_url=TTS_URL, api_key=os.getenv("TTS_API_KEY", "not-needed"), timeout=900.0)
     return llm, tts
 
 llm_client, tts_client = get_clients()
@@ -1129,7 +1129,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                     },
                     headers={"Authorization": f"Bearer {os.getenv('TTS_API_KEY', 'not-needed')}"},
                     stream=True,
-                    timeout=60
+                    timeout=600
                 )
 
                 if tts_response.status_code == 200:
