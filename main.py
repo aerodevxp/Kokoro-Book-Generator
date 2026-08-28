@@ -240,6 +240,38 @@ def load_features():
         features = default_features
     return features
 
+def generate_chapter_summary(chapter_text, chapter_num, job_id=None):
+    """Generate a short summary of a chapter after it's written"""
+    clean_text = remove_voice_tags(chapter_text)
+    
+    prompt = f"""Summarize this chapter in 150 words max. Include:
+- Key events that occurred
+- Character developments or revelations
+- Important dialogue or decisions
+- Any new information or plot threads introduced
+
+Chapter {chapter_num}:
+{clean_text}
+
+Chapter summary (150 words max):"""
+    
+    response = llm_client.chat.completions.create(
+        model=STORY_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=250,
+        temperature=0.3
+    )
+    
+    return response.choices[0].message.content.strip()
+
+def build_running_summary(chapter_summaries):
+    """Combine all chapter summaries into a running context"""
+    if not chapter_summaries:
+        return ""
+    
+    combined = "\n\n".join([f"Chapter {i+1}: {summary}" for i, summary in enumerate(chapter_summaries)])
+    return f"STORY SO FAR (summaries of previous chapters):\n{combined}\n\n"
+
 def get_all_stories():
     story_files = []
     for story_dir in Path(OUTPUT_DIR).iterdir():
@@ -252,19 +284,126 @@ def get_all_stories():
                     story_files.extend([f for f in story_dir.glob("*.txt") if not f.name.endswith("_metadata.json") and not f.name.endswith("_tts.txt") and not f.name.endswith("_cleaned.txt")])
     return story_files
 
-def load_story_context(story_path):
+def generate_story_summary(story_path, job_id=None):
+    """Generate a max 600-word summary — uses chapter summaries if available, otherwise chunks the full text"""
+    
+    # Check for existing chapter summaries first
+    chapter_summaries_path = story_path.parent / f"{story_path.stem}_chapter_summaries.json"
+    if chapter_summaries_path.exists():
+        if job_id:
+            update_job_status(job_id, "running", 0.1, "Found chapter summaries, combining them...")
+        
+        with open(chapter_summaries_path, 'r') as f:
+            chapter_summaries = json.load(f)
+        
+        if chapter_summaries:
+            summary = generate_book_summary_from_chapters(chapter_summaries, story_path.stem, story_path.parent, job_id)
+            return summary
+    
+    # Fall back to chunked summarization if no chapter summaries exist
+    if job_id:
+        update_job_status(job_id, "running", 0.05, "No chapter summaries found, chunking full text...")
+    
+    # Read the story
+    tts_path = story_path.parent / f"{story_path.stem}_tts.txt"
+    if tts_path.exists():
+        with open(tts_path, 'r') as f:
+            story_content = f.read()
+    else:
+        with open(story_path, 'r') as f:
+            story_content = f.read()
+    
+    clean_content = remove_voice_tags(story_content)
+    
+    # Split into chunks of ~3000 words
+    words = clean_content.split()
+    chunk_size = 3000
+    chunks = []
+    
+    for i in range(0, len(words), chunk_size):
+        chunk = ' '.join(words[i:i+chunk_size])
+        chunks.append(chunk)
+    
+    if job_id:
+        update_job_status(job_id, "running", 0.05, f"Summarizing '{story_path.stem}' in {len(chunks)} chunks...")
+    
+    # Summarize each chunk
+    chunk_summaries = []
+    for i, chunk in enumerate(chunks):
+        prompt = f"""Summarize this section of a story in 150 words max. Include:
+- Key characters and events in this section
+- Important plot developments
+- Any new settings or relationships
+
+Story section {i+1} of {len(chunks)}:
+{chunk}
+
+Section summary (150 words max):"""
+        
+        response = llm_client.chat.completions.create(
+            model=STORY_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=250,
+            temperature=0.3
+        )
+        
+        chunk_summaries.append(response.choices[0].message.content.strip())
+        
+        if job_id:
+            progress = 0.05 + (i + 1) / len(chunks) * 0.05
+            update_job_status(job_id, "running", progress, 
+                            f"Summarizing '{story_path.stem}': chunk {i+1}/{len(chunks)} done")
+    
+    # Combine chunk summaries into final summary
+    combined_text = "\n\n".join(chunk_summaries)
+    
+    final_prompt = f"""Below are section summaries from a story. Combine them into ONE cohesive summary of maximum 600 words. Include:
+- Main characters and their relationships
+- Key plot points and events
+- Important settings/locations
+- How the story ends
+- Any unresolved threads or cliffhangers
+
+Section summaries:
+{combined_text}
+
+Final summary (600 words max):"""
+    
+    response = llm_client.chat.completions.create(
+        model=STORY_MODEL,
+        messages=[{"role": "user", "content": final_prompt}],
+        max_tokens=800,
+        temperature=0.3
+    )
+    
+    summary = response.choices[0].message.content.strip()
+    
+    # Save for future use
+    summary_path = story_path.parent / f"{story_path.stem}_summary.txt"
+    with open(summary_path, 'w') as f:
+        f.write(summary)
+    
+    return summary
+
+def load_story_context(story_path, job_id=None):
+    """Load story summary for context injection — generates one if it doesn't exist"""
     if not story_path:
         return ""
     try:
-        tts_path = story_path.parent / f"{story_path.stem}_tts.txt"
-        if tts_path.exists():
-            with open(tts_path, 'r') as f:
-                content = f.read()
+        summary_path = story_path.parent / f"{story_path.stem}_summary.txt"
+        
+        # Check if summary already exists
+        if summary_path.exists():
+            with open(summary_path, 'r') as f:
+                summary = f.read()
         else:
-            with open(story_path, 'r') as f:
-                content = f.read()
-        return f"Reference Story Context (from '{story_path.stem}'):\n{content}\n\n"
+            # Generate a new summary
+            print(f"[INFO] No summary found for '{story_path.stem}', generating one...")
+            summary = generate_story_summary(story_path, job_id)
+        
+        return f"Reference Story Summary (from '{story_path.stem}'):\n{summary}\n\n"
     except Exception as e:
+        print(f"Error loading/generating story summary: {e}")
         return ""
 
 def get_worldbooks():
@@ -628,6 +767,32 @@ def cleanup_old_jobs(keep_last=5):
     for job in finished_jobs[keep_last:]:
         delete_job(job['job_id'])
 
+def is_cancel_requested(job_id):
+    """Check if cancellation was requested for this job"""
+    status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+    if status_file.exists():
+        try:
+            with open(status_file, 'r') as f:
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                    return data.get('cancel_requested', False)
+        except:
+            pass
+    return False
+
+def request_cancel(job_id):
+    """Request cancellation of a job"""
+    status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+    if status_file.exists():
+        try:
+            with open(status_file, 'r') as f:
+                data = json.loads(f)
+            data['cancel_requested'] = True
+            with open(status_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except:
+            pass
 # --- Background Workers ---
 
 
@@ -635,6 +800,11 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
     """Background worker for story generation"""
     cleanup_old_jobs(keep_last=3)
     try:
+        def check_cancel():
+            if is_cancel_requested(job_id):
+                update_job_status(job_id, "error", 0, "Generation cancelled by user")
+                return True
+            return False
         update_job_status(job_id, "running", 0, "Starting generation...", job_type="story")
         base_prompt = read_base_prompt()
         
@@ -645,7 +815,7 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             character_voices = extract_character_voices(wb_content)
         
         voice_instruction = build_voice_instruction(character_voices if character_voices else None)
-        story_context = load_story_context(reference_story)
+        story_context = load_story_context(reference_story, job_id)
         worldbook_context = load_worldbook_context(worldbook_path)
 
         if debug_mode:
@@ -671,7 +841,7 @@ Genre: {genre if genre else 'AI decides'}
 {features_instruction}
 Length requirement: {length_instruction}
 List each chapter with a brief description."""
-            
+            if check_cancel(): return
             response = llm_client.chat.completions.create(
                 model=STORY_MODEL, messages=[{"role": "user", "content": prompt}],
                 max_tokens=1500, temperature=0.8, stream=True
@@ -696,10 +866,14 @@ List each chapter with a brief description."""
 
             # Phase 2: Write Story
             story_parts = []
+            chapter_summaries = []
             
             for chapter_num in range(1, total_chapters + 1):
+                if check_cancel(): return
                 chapter_progress = 0.1 + (chapter_num - 1) / total_chapters * 0.7
                 update_job_status(job_id, "running", chapter_progress, f"Phase 2: Writing Chapter {chapter_num}/{total_chapters}...")
+
+                running_summary = build_running_summary(chapter_summaries)
                 
                 if chapter_num == 1:
                     ch_prompt = f"""{base_prompt}
@@ -731,13 +905,31 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                             ch_tokens += 1
                 
                 story_parts.append(chapter)
+
+                update_job_status(job_id, "running", chapter_progress, 
+                                 f"Chapter {chapter_num}/{total_chapters} written ({ch_tokens} tokens). Summarizing...")
+                chapter_summary = generate_chapter_summary(chapter, chapter_num, job_id)
+                chapter_summaries.append(chapter_summary)
+
+                summaries_path = story_dir / f"{sanitize_title(title)}_chapter_summaries.json"
+                with open(summaries_path, 'w') as f:
+                    json.dump(chapter_summaries, f, indent=2)
+
                 chapter_progress = 0.1 + chapter_num / total_chapters * 0.7
                 update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}/{total_chapters} Completed ({ch_tokens} tokens)")
             
             story = "\n\n".join(story_parts)
 
+            # Validate story
+            if not story.strip():
+                update_job_status(job_id, "error", 0, "Failed to generate story - empty response from AI")
+                return
+            
+            
+
             # Phase 3: Title
             update_job_status(job_id, "running", 0.85, "Phase 3: Generating Title...")
+            if check_cancel(): return
             try:
                 title_prompt = f"Based on the following story outline, create ONE compelling title:\n========\n{outline}\n========\nONLY OUTPUT THE TITLE, NOTHING ELSE!"
                 title_response = llm_client.chat.completions.create(
@@ -748,6 +940,11 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
             except:
                 title = "Untitled-Story"
             update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
+
+            if chapter_summaries and not debug_mode:
+                update_job_status(job_id, "running", 0.92, "Generating book summary from chapter summaries...")
+                book_summary = generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id)
+                update_job_status(job_id, "running", 0.93, "Book summary generated!")
 
         # Save Files
         update_job_status(job_id, "running", 0.9, "Saving files...", title=title)
@@ -766,6 +963,7 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
 
         # TTS
         if want_tts:
+            if check_cancel(): return
             audiobook_path = generate_tts_background(story, title, story_dir, job_id)
             if audiobook_path:
                 files.append(str(audiobook_path))
@@ -864,6 +1062,9 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     for i, paragraph in enumerate(paragraphs):
         if not paragraph.strip():
             continue
+        if is_cancel_requested(job_id):
+            update_job_status(job_id, "error", 0, "TTS generation cancelled by user")
+            return None
         
         audio_file = tts_dir / f"paragraph_{i:04d}.mp3"
         success = False
@@ -988,7 +1189,44 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     
     return audiobook_path
 
+def generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id=None):
+    """Generate a 600-word book summary from existing chapter summaries"""
+    if not chapter_summaries:
+        return ""
+    
+    # Combine all chapter summaries
+    combined = "\n\n".join([f"Chapter {i+1}: {summary}" for i, summary in enumerate(chapter_summaries)])
+    
+    if job_id:
+        update_job_status(job_id, "running", 0.88, "Generating book summary from chapter summaries...")
+    
+    prompt = f"""Below are chapter summaries from a story. Combine them into ONE cohesive summary of maximum 600 words. Include:
+- Main characters and their relationships
+- Key plot points and events
+- Important settings/locations
+- How the story ends
+- Any unresolved threads or cliffhangers
 
+Chapter summaries:
+{combined}
+
+Final book summary (600 words max):"""
+    
+    response = llm_client.chat.completions.create(
+        model=STORY_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=800,
+        temperature=0.3
+    )
+    
+    summary = response.choices[0].message.content.strip()
+    
+    # Save for future use
+    summary_path = story_dir / f"{sanitize_title(title)}_summary.txt"
+    with open(summary_path, 'w') as f:
+        f.write(summary)
+    
+    return summary
 
 # --- Streamlit UI Pages ---
 
@@ -1014,6 +1252,14 @@ def main():
                 st.markdown(f"**{job_type.title()}:** {title}")
                 st.progress(job['progress'])
                 st.caption(job['message'][:80] + ('...' if len(job['message']) > 80 else ''))
+                
+                # Cancel button in sidebar
+                if st.button("❌ Cancel", key=f"cancel_sidebar_{job_id}"):
+                    request_cancel(job_id)
+                    st.warning("Cancelling...")
+                    time.sleep(1)
+                    st.rerun()
+                
                 st.caption(f"Job ID: `{job_id}`")
                 st.divider()
         
@@ -1051,6 +1297,14 @@ def generate_new_story_page():
             if job['status'] == 'running':
                 st.info(f"🔄 **Active Job:** {job['message']}")
                 st.progress(job['progress'])
+                
+                # Cancel button
+                if st.button("❌ Cancel Generation", type="secondary"):
+                    request_cancel(st.session_state['current_job_id'])
+                    st.warning("Cancellation requested. Job will stop at next checkpoint...")
+                    time.sleep(2)
+                    st.rerun()
+                
                 time.sleep(2)
                 st.rerun()
             elif job['status'] == 'completed':
@@ -1230,6 +1484,13 @@ def job_status_page():
             
             if job['status'] == 'running':
                 st.progress(job['progress'])
+                
+                # Cancel button
+                if st.button("❌ Cancel This Job", key=f"cancel_{job_id}"):
+                    request_cancel(job_id)
+                    st.warning("Cancellation requested...")
+                    time.sleep(2)
+                    st.rerun()
             elif job['status'] == 'completed':
                 st.success("✅ Generation Complete!")
                 for file_path in job.get('files', []):
@@ -1311,6 +1572,16 @@ def generate_tts_existing_page():
         st.success(f"✅ TTS generation started in background! Job ID: {job_id}")
         st.rerun()
 
+def run_summary_worker(job_id, story_path):
+    """Background worker for generating a book summary"""
+    try:
+        update_job_status(job_id, "running", 0, "Loading story for summary...", job_type="summary")
+        summary = generate_story_summary(story_path, job_id)
+        summary_path = story_path.parent / f"{story_path.stem}_summary.txt"
+        update_job_status(job_id, "completed", 1.0, "Summary generated successfully!", [str(summary_path)], story_path.stem, job_type="summary")
+    except Exception as e:
+        update_job_status(job_id, "error", 0, str(e), job_type="summary")
+
 def story_library_page():
     st.header("📚 Story Library")
     stories = get_all_stories()
@@ -1328,6 +1599,27 @@ def story_library_page():
     
     st.subheader(selected_file.stem)
     st.text_area("Content", story_content, height=500)
+
+    st.divider()
+    summary_path = selected_file.parent / f"{selected_file.stem}_summary.txt"
+    
+    if summary_path.exists():
+        st.success("✅ Book summary exists. Ready for sequels!")
+        with open(summary_path, 'r') as f:
+            st.text_area("Summary Content", f.read(), height=200)
+    else:
+        st.warning("No book summary found. Generate one to speed up future sequels.")
+        if st.button("Generate Book Summary", type="primary"):
+            job_id = f"summary_{int(time.time())}"
+            thread = threading.Thread(
+                target=run_summary_worker,
+                args=(job_id, selected_file)
+            )
+            thread.daemon = True
+            thread.start()
+            st.success(f"✅ Summary generation started in background! Job ID: {job_id}")
+            time.sleep(2)
+            st.rerun()
     
     audiobook_path = selected_file.parent / f"{selected_file.stem}_audiobook.mp3"
     if audiobook_path.exists():
