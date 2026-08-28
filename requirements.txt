@@ -7,7 +7,7 @@ time
 requests
 sys
 dotenv
-spire.doc
+fpdf2
 pydub
 ffmpeg
 audioio
