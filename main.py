@@ -6,6 +6,7 @@ import time
 import json
 import re
 import shutil
+import threading
 from spire.doc import *
 from dotenv import load_dotenv
 from pydub import AudioSegment
@@ -23,6 +24,7 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR")
 WORLDBOOK_DIR = os.getenv("WORLDBOOK_DIR", os.path.join(OUTPUT_DIR, "worldbooks"))
 SERIES_DIR = os.getenv("SERIES_DIR", os.path.join(OUTPUT_DIR, "series"))
 FEATURES_FILE = os.getenv("FEATURES_FILE", os.path.join(OUTPUT_DIR, "features.txt"))
+JOBS_DIR = os.getenv("JOBS_DIR", os.path.join(OUTPUT_DIR, "jobs"))
 
 VALID_VOICES = {
     "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore",
@@ -58,7 +60,6 @@ Raph smiled. <am_adam>To the future, then.</am_adam>
 
 <af_nova>To the future.</af_nova>"""
 
-# Initialize OpenAI clients
 @st.cache_resource
 def get_clients():
     llm = openai.OpenAI(base_url=BASE_URL, api_key=os.getenv("LLM_API_KEY", "dummy-key"))
@@ -66,8 +67,6 @@ def get_clients():
     return llm, tts
 
 llm_client, tts_client = get_clients()
-
-# --- Helper Functions ---
 
 def read_base_prompt():
     try:
@@ -77,7 +76,7 @@ def read_base_prompt():
         return ""
 
 def ensure_directories():
-    dirs = [OUTPUT_DIR, WORLDBOOK_DIR, SERIES_DIR]
+    dirs = [OUTPUT_DIR, WORLDBOOK_DIR, SERIES_DIR, JOBS_DIR]
     for directory in dirs:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
@@ -85,32 +84,84 @@ def string_to_pdf(string, outputFullPath):
     document = Document()
     section = document.AddSection()
     section.PageSetup.Margins.All = 72
-    p = section.AddParagraph()
-    text_range = p.AppendText(string)
-    text_range.CharacterFormat.FontName = "Arial"
-    text_range.CharacterFormat.FontSize = 21
-    text_range.CharacterFormat.TextColor = Color.FromRgb(34, 34, 34)
+    
+    paragraphs = [p.strip() for p in string.split('\n\n') if p.strip()]
+    if not paragraphs:
+        paragraphs = [string]
+    
+    for i, para in enumerate(paragraphs):
+        p = section.AddParagraph()
+        text_range = p.AppendText(para)
+        text_range.CharacterFormat.FontName = "Arial"
+        text_range.CharacterFormat.FontSize = 12
+        text_range.CharacterFormat.TextColor = Color.FromRgb(34, 34, 34)
+        if i > 0:
+            p.ParagraphFormat.SpaceAfter = 6
+    
     document.SaveToFile(outputFullPath, FileFormat.PDF)
     document.Close()
 
-def build_voice_instruction():
-    return """
+def clean_text_for_tts(text):
+    text = text.replace('"', '').replace('"', '').replace('"', '')
+    text = text.replace(''', '').replace(''', '')
+    text = text.replace('—', ', ').replace('–', ', ')
+    text = ' '.join(text.split())
+    return text.strip()
+
+def extract_character_voices(worldbook_content):
+    voices = {}
+    match = re.search(r'$$CHARACTER VOICES$$(.*?)(?:\n$$|\Z)', worldbook_content, re.DOTALL)
+    if match:
+        voice_section = match.group(1).strip()
+        for line in voice_section.split('\n'):
+            if ':' in line:
+                parts = line.split(':', 1)
+                char_name = parts[0].strip()
+                voice = parts[1].strip()
+                if voice in VALID_VOICES:
+                    voices[char_name] = voice
+    return voices
+
+def build_voice_instruction(character_voices=None):
+    instruction = """
 VOICE TAG INSTRUCTIONS:
 - Wrap ALL character dialogue in voice tags using this format: <voice_name>dialogue</voice_name>
-- Do NOT wrap narration in voice tags - narration uses the default voice (af_heart)
+- Wrap ALL narration in voice tags too, using the appropriate narration voice (see NARRATION VOICE below)
 - Assign each character a consistent voice from the available Kokoro voices listed below
 - Keep character voices consistent throughout the entire story
 - The voice name in the tag must be an EXACT match from the available voices list
 - If continuing from a reference story, use the SAME voices for the SAME characters
 
+NARRATION VOICE:
+- For omniscient/third-person objective narration: use af_heart
+- For first-person POV: use the POV character's voice for narration AND internal thoughts
+- For limited third-person POV: use the focal character's voice for narration
+- If the story switches POVs between scenes, use whichever character's perspective the current scene is from
+- You decide the best narration style based on the story content
+"""
+    
+    if character_voices:
+        instruction += "\nCHARACTER VOICES (from worldbook - use these EXACT voices for these characters):\n"
+        for char, voice in character_voices.items():
+            instruction += f"- {char}: {voice}\n"
+        instruction += "\nFor new characters not listed above, assign voices from the available list.\n"
+    
+    instruction += """
 Available voices:
 Female: af_heart, af_alloy, af_aoede, af_bella, af_jessica, af_kore, af_nicole, af_nova, af_river, af_sarah, af_sky, bf_alice, bf_emma, bf_isabella, bf_lily, jf_alpha, jf_gongitsune, jf_nezumi, jf_tebukuro, zf_xiaobei, zf_xiaoni, zf_xiaoxiao, zf_xiaoyi, ef_dora, ff_siwis, hf_alpha, hf_beta, if_sara, pf_dora
 Male: am_adam, am_echo, am_eric, am_fenrir, am_liam, am_michael, am_onyx, am_puck, am_santa, bm_daniel, bm_fable, bm_george, bm_lewis, jm_kumo, zm_yunjian, zm_yunxi, zm_yunxia, zm_yunyang, em_alex, em_santa, hm_omega, hm_psi, im_nicola, pm_alex, pm_santa
 
-Example:
+Example (omniscient narration):
+<af_heart>The sun set over the mountains, casting long shadows across the valley.</af_heart>
+<af_bella>"I can't believe you did that!"</af_bella>
+<am_adam>"It was the only way."</am_adam>
+
+Example (first-person POV from Bella's perspective):
+<af_bella>The sun set over the mountains. I watched from the window, thinking about everything that had happened.</af_bella>
 <af_bella>"I can't believe you did that!"</af_bella>
 <am_adam>"It was the only way."</am_adam>
 """
+    return instruction
 
 def extract_voices_used(story):
     voices = set()
@@ -140,7 +191,7 @@ def load_features():
 def get_all_stories():
     story_files = []
     for story_dir in Path(OUTPUT_DIR).iterdir():
-        if story_dir.is_dir():
+        if story_dir.is_dir() and story_dir.name not in ["worldbooks", "series", "jobs"]:
             story_files.extend([f for f in story_dir.glob("*.txt") if not f.name.endswith("_metadata.json") and not f.name.endswith("_tts.txt") and not f.name.endswith("_cleaned.txt")])
     for series_dir in Path(SERIES_DIR).iterdir():
         if series_dir.is_dir():
@@ -248,117 +299,230 @@ def parse_tts_text(text):
             segments.append({'voice': 'af_heart', 'text': remaining_text})
     return segments
 
-# --- Streamlit UI & Core Logic ---
-
-def main():
-    st.set_page_config(page_title="Story Generator", page_icon="📖", layout="wide")
-    ensure_directories()
-
-    st.title("📖 Story Generator")
-    st.markdown("Generate stories with AI, complete with multi-voice TTS audiobook generation.")
-
-    # Sidebar Navigation
-    menu = ["Generate New Story", "Generate TTS for Existing", "Story Library", "Worldbook Manager", "Feature Manager", "Clean Existing Story"]
-    choice = st.sidebar.selectbox("Menu", menu)
-
-    if choice == "Generate New Story":
-        generate_new_story_page()
-    elif choice == "Generate TTS for Existing":
-        generate_tts_existing_page()
-    elif choice == "Story Library":
-        story_library_page()
-    elif choice == "Worldbook Manager":
-        worldbook_manager_page()
-    elif choice == "Feature Manager":
-        feature_manager_page()
-    elif choice == "Clean Existing Story":
-        clean_existing_story_page()
-
-def generate_new_story_page():
-    st.header("Generate New Story")
+def get_all_series():
+    series_list = []
+    if not Path(SERIES_DIR).exists():
+        return series_list
     
-    with st.form("story_config"):
-        col1, col2 = st.columns(2)
-        with col1:
-            topic = st.text_input("Topic", placeholder="Leave blank for AI to decide")
-            genre = st.text_input("Genre", placeholder="Leave blank for AI to decide")
-            story_type = st.selectbox("Story Type", ["standalone", "sequel", "prequel"])
-            
-            reference_story = None
-            series_name = None
-            
-            if story_type in ["sequel", "prequel"]:
-                stories = get_all_stories()
-                story_opts = ["None"] + [str(s.relative_to(Path(OUTPUT_DIR).parent)) for s in stories]
-                ref_choice = st.selectbox("Reference Story", story_opts)
-                if ref_choice != "None":
-                    reference_story = next(s for s in stories if str(s.relative_to(Path(OUTPUT_DIR).parent)) == ref_choice)
-                    try:
-                        rel_path = reference_story.relative_to(Path(SERIES_DIR))
-                        series_name = rel_path.parts[0]
-                    except ValueError:
-                        series_name = st.text_input("Reference is standalone. Enter new series name:", value="NewSeries")
+    for series_dir in Path(SERIES_DIR).iterdir():
+        if series_dir.is_dir():
+            meta_path = series_dir / "series.json"
+            if meta_path.exists():
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                series_list.append(meta)
             else:
-                is_series = st.checkbox("Is this part of a series?")
-                if is_series:
-                    series_dirs = [d.name for d in Path(SERIES_DIR).iterdir() if d.is_dir()]
-                    series_opts = ["Create New Series"] + series_dirs
-                    s_choice = st.selectbox("Select Series", series_opts)
-                    if s_choice == "Create New Series":
-                        series_name = st.text_input("Enter new series name:")
-                    else:
-                        series_name = s_choice
+                stories = []
+                for story_dir in series_dir.iterdir():
+                    if story_dir.is_dir():
+                        story_files = [f for f in story_dir.glob("*.txt") if not f.name.endswith("_metadata.json") and not f.name.endswith("_tts.txt") and not f.name.endswith("_cleaned.txt")]
+                        if story_files:
+                            stories.append({
+                                "title": story_dir.name,
+                                "order": len(stories) + 1,
+                                "type": "standalone",
+                                "reference": None,
+                                "path": str(story_files[0].relative_to(series_dir)),
+                                "created": time.strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                meta = {
+                    "name": series_dir.name,
+                    "worldbook": None,
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "stories": stories
+                }
+                with open(meta_path, 'w') as f:
+                    json.dump(meta, f, indent=2)
+                series_list.append(meta)
+    
+    return series_list
 
-        with col2:
-            worldbooks = get_worldbooks()
-            wb_opts = ["None"] + [wb.stem for wb in worldbooks]
-            wb_choice = st.selectbox("Worldbook", wb_opts)
-            worldbook_path = next((wb for wb in worldbooks if wb.stem == wb_choice), None) if wb_choice != "None" else None
-            
-            features = load_features()
-            selected_features = st.multiselect("Required Features", features)
-            
-            length_opts = {
-                "Short (5-8 chapters)": "Keep it short with 5-8 chapters total",
-                "Medium (10-15 chapters)": "Make it medium length with 10-15 chapters total",
-                "Long (20-25 chapters)": "Make it long with 20-25 chapters total",
-                "AI decides": "Decide the optimal chapter count yourself"
-            }
-            length_choice = st.selectbox("Story Length", list(length_opts.keys()))
-            length_instruction = length_opts[length_choice]
-            
-            want_tts = st.checkbox("Generate TTS Audiobook", value=True)
-            debug_mode = st.checkbox("Debug Mode (Use Test Story, skip AI)")
-            
-            submit_btn = st.form_submit_button("🚀 Generate Story", type="primary")
+def load_series_metadata(series_name):
+    meta_path = Path(SERIES_DIR) / series_name / "series.json"
+    if meta_path.exists():
+        with open(meta_path, 'r') as f:
+            return json.load(f)
+    return None
 
-    if submit_btn:
-        run_generation(topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode)
+def save_series_metadata(series_name, metadata):
+    series_dir = Path(SERIES_DIR) / series_name
+    series_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = series_dir / "series.json"
+    with open(meta_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
 
-def run_generation(topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode):
-    base_prompt = read_base_prompt()
-    voice_instruction = build_voice_instruction()
-    story_context = load_story_context(reference_story)
-    worldbook_context = load_worldbook_context(worldbook_path)
+def add_story_to_series(series_name, title, story_type, reference, story_filepath, worldbook=None):
+    if not series_name:
+        return
+    
+    meta = load_series_metadata(series_name)
+    if not meta:
+        meta = {
+            "name": series_name,
+            "worldbook": worldbook,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "stories": []
+        }
+    
+    if worldbook and not meta.get("worldbook"):
+        meta["worldbook"] = worldbook
+    
+    existing = next((s for s in meta["stories"] if s["title"] == title), None)
+    if not existing:
+        order = len(meta["stories"]) + 1
+        meta["stories"].append({
+            "title": title,
+            "order": order,
+            "type": story_type,
+            "reference": str(reference) if reference else None,
+            "path": str(story_filepath.relative_to(Path(SERIES_DIR) / series_name)),
+            "created": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+    
+    save_series_metadata(series_name, meta)
 
-    status_ph = st.empty()
-    prog_bar = st.progress(0)
+def add_existing_story_to_series(story_path, series_name, story_type="standalone", reference=None):
+    if not story_path or not series_name:
+        return False, "Story path and series name required"
+    
+    story_path = Path(story_path)
+    story_folder = story_path.parent
+    story_title = story_folder.name
+    
+    series_dir = Path(SERIES_DIR) / series_name
+    target_folder = series_dir / story_title
+    
+    if target_folder.exists():
+        return False, f"Story '{story_title}' already exists in series '{series_name}'"
+    
+    series_dir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(story_folder), str(target_folder))
+    
+    new_story_path = target_folder / story_path.name
+    add_story_to_series(series_name, story_title, story_type, reference, new_story_path)
+    
+    try:
+        old_rel = story_path.relative_to(Path(SERIES_DIR))
+        old_series_name = old_rel.parts[0]
+        if old_series_name != series_name:
+            old_meta = load_series_metadata(old_series_name)
+            if old_meta:
+                old_meta["stories"] = [s for s in old_meta["stories"] if s["title"] != story_title]
+                save_series_metadata(old_series_name, old_meta)
+    except ValueError:
+        pass
+    
+    meta_file = target_folder / f"{story_title}_metadata.json"
+    if meta_file.exists():
+        with open(meta_file, 'r') as f:
+            meta = json.load(f)
+        meta["story_type"] = story_type
+        meta["reference_story"] = str(reference) if reference else None
+        with open(meta_file, 'w') as f:
+            json.dump(meta, f, indent=2)
+    
+    return True, target_folder
 
-    if debug_mode:
-        story = TEST_STORY
-        title = "Debug Test Story"
-        status_ph.success("Debug mode: Loaded test story.")
-    else:
-        # Phase 1: Outline
-        status_ph.info("Phase 1: Generating Outline...")
-        features_instruction = f"The story MUST include these elements: {', '.join(features)}. " if features else ""
-        type_instruction = ""
-        if story_type == "sequel":
-            type_instruction = "This is a SEQUEL - continue the story logically from previous events while introducing new conflicts."
-        elif story_type == "prequel":
-            type_instruction = "This is a PREQUEL - explore events leading up to referenced story with established characters/settings."
+def get_worldbook_metadata(worldbook_path):
+    meta_path = worldbook_path.with_suffix('.meta.json')
+    if meta_path.exists():
+        with open(meta_path, 'r') as f:
+            return json.load(f)
+    return {
+        "name": worldbook_path.stem,
+        "linked_series": []
+    }
+
+def save_worldbook_metadata(worldbook_path, metadata):
+    meta_path = worldbook_path.with_suffix('.meta.json')
+    with open(meta_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+def update_worldbook_series_link(worldbook_path, series_name):
+    if not worldbook_path or not series_name:
+        return
+    meta = get_worldbook_metadata(worldbook_path)
+    if series_name not in meta["linked_series"]:
+        meta["linked_series"].append(series_name)
+    save_worldbook_metadata(worldbook_path, meta)
+
+# --- Job Status Functions ---
+
+def update_job_status(job_id, status, progress=0, message="", files=None, title=None, job_type="story"):
+    """Update job status file"""
+    status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+    with open(status_file, 'w') as f:
+        json.dump({
+            "job_id": job_id,
+            "job_type": job_type,
+            "status": status,
+            "progress": progress,
+            "message": message,
+            "files": files or [],
+            "title": title,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }, f, indent=2)
+
+def get_job_status(job_id):
+    """Get job status from file"""
+    status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+    if status_file.exists():
+        with open(status_file, 'r') as f:
+            return json.load(f)
+    return None
+
+def get_all_jobs():
+    """Get all job status files"""
+    jobs = []
+    if not Path(JOBS_DIR).exists():
+        return jobs
+    for status_file in Path(JOBS_DIR).glob("job_*_status.json"):
+        try:
+            with open(status_file, 'r') as f:
+                jobs.append(json.load(f))
+        except:
+            pass
+    return jobs
+
+def delete_job(job_id):
+    """Delete job status file"""
+    status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+    if status_file.exists():
+        status_file.unlink()
+
+# --- Background Workers ---
+
+def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode):
+    """Background worker for story generation"""
+    try:
+        update_job_status(job_id, "running", 0, "Starting generation...", job_type="story")
+        base_prompt = read_base_prompt()
         
-        prompt = f"""{base_prompt}
+        character_voices = {}
+        if worldbook_path:
+            with open(worldbook_path, 'r') as f:
+                wb_content = f.read()
+            character_voices = extract_character_voices(wb_content)
+        
+        voice_instruction = build_voice_instruction(character_voices if character_voices else None)
+        story_context = load_story_context(reference_story)
+        worldbook_context = load_worldbook_context(worldbook_path)
+
+        if debug_mode:
+            story = TEST_STORY
+            title = "Debug Test Story"
+            update_job_status(job_id, "running", 0.1, "Debug mode: Loaded test story.", title=title)
+        else:
+            # Phase 1: Outline
+            update_job_status(job_id, "running", 0, "Phase 1: Generating Outline...")
+            features_instruction = f"The story MUST include these elements: {', '.join(features)}. " if features else ""
+            type_instruction = ""
+            if story_type == "sequel":
+                type_instruction = "This is a SEQUEL - continue the story logically from previous events while introducing new conflicts."
+            elif story_type == "prequel":
+                type_instruction = "This is a PREQUEL - explore events leading up to referenced story with established characters/settings."
+            
+            prompt = f"""{base_prompt}
 {worldbook_context}{story_context}{voice_instruction}
 Generate a detailed story outline.
 Topic: {topic if topic else 'a compelling story of your choice'}
@@ -367,111 +531,155 @@ Genre: {genre if genre else 'AI decides'}
 {features_instruction}
 Length requirement: {length_instruction}
 List each chapter with a brief description."""
-        
-        response = llm_client.chat.completions.create(
-            model=STORY_MODEL, messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500, temperature=0.8, stream=True
-        )
-        
-        outline = ""
-        token_count = 0
-        for chunk in response:
-            if chunk.choices and chunk.choices[0].delta:
-                content = chunk.choices[0].delta.content
-                if content:
-                    outline += content
-                    token_count += 1
-                    if token_count % 15 == 0:
-                        status_ph.info(f"Phase 1: Generating Outline... {token_count} tokens")
-        
-        status_ph.success(f"Phase 1: Outline Complete ({token_count} tokens)")
-        with st.expander("View Outline"):
-            st.write(outline)
-
-        # Extract chapters
-        chapter_matches = re.findall(r'(?:Chapter|chapter)\s+(\d+)', outline, re.IGNORECASE)
-        total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
-        st.info(f"Detected {total_chapters} chapters")
-
-        # Phase 2: Write Story
-        status_ph.info(f"Phase 2: Writing Story ({total_chapters} Chapters)...")
-        story_parts = []
-        
-        for chapter_num in range(1, total_chapters + 1):
-            if chapter_num == 1:
-                ch_prompt = f"""{base_prompt}
-{worldbook_context}{story_context}{voice_instruction}
-Based on this outline:
-{outline}
-Write Chapter {chapter_num} in detail. Wrap ALL dialogue in voice tags as described in the voice instructions above."""
-            else:
-                prev_content = ' '.join(story_parts[-1:])
-                ch_prompt = f"""{base_prompt}
-{worldbook_context}{story_context}{voice_instruction}
-Continue the story from:
-{prev_content}
-Write Chapter {chapter_num} in detail. Wrap ALL dialogue in voice tags as described in the voice instructions above."""
-            ch_prompt += " End this chapter with [END]"
             
             response = llm_client.chat.completions.create(
-                model=STORY_MODEL, messages=[{"role": "user", "content": ch_prompt}],
-                max_tokens=2048, temperature=0.8, stream=True
+                model=STORY_MODEL, messages=[{"role": "user", "content": prompt}],
+                max_tokens=1500, temperature=0.8, stream=True
             )
             
-            chapter = ""
-            ch_tokens = 0
+            outline = ""
+            token_count = 0
             for chunk in response:
                 if chunk.choices and chunk.choices[0].delta:
                     content = chunk.choices[0].delta.content
                     if content:
-                        chapter += content
-                        ch_tokens += 1
-                        if ch_tokens % 15 == 0:
-                            status_ph.info(f"Phase 2: Writing Chapter {chapter_num}/{total_chapters}... {ch_tokens} tokens")
+                        outline += content
+                        token_count += 1
+                        if token_count % 15 == 0:
+                            update_job_status(job_id, "running", min(0.05, token_count / 1000), f"Phase 1: Generating Outline... {token_count} tokens")
             
-            story_parts.append(chapter)
-            prog_bar.progress(chapter_num / total_chapters)
-            status_ph.success(f"Chapter {chapter_num}/{total_chapters} Completed ({ch_tokens} tokens)")
+            update_job_status(job_id, "running", 0.1, f"Phase 1: Outline Complete ({token_count} tokens)")
+
+            chapter_matches = re.findall(r'(?:Chapter|chapter)\s+(\d+)', outline, re.IGNORECASE)
+            total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
+            update_job_status(job_id, "running", 0.1, f"Detected {total_chapters} chapters. Starting Phase 2...")
+
+            # Phase 2: Write Story
+            story_parts = []
+            
+            for chapter_num in range(1, total_chapters + 1):
+                chapter_progress = 0.1 + (chapter_num - 1) / total_chapters * 0.7
+                update_job_status(job_id, "running", chapter_progress, f"Phase 2: Writing Chapter {chapter_num}/{total_chapters}...")
+                
+                if chapter_num == 1:
+                    ch_prompt = f"""{base_prompt}
+{worldbook_context}{story_context}{voice_instruction}
+Based on this outline:
+{outline}
+Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above."""
+                else:
+                    prev_content = ' '.join(story_parts[-1:])
+                    ch_prompt = f"""{base_prompt}
+{worldbook_context}{story_context}{voice_instruction}
+Continue the story from:
+{prev_content}
+Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above."""
+                ch_prompt += " End this chapter with [END]"
+                
+                response = llm_client.chat.completions.create(
+                    model=STORY_MODEL, messages=[{"role": "user", "content": ch_prompt}],
+                    max_tokens=2048, temperature=0.8, stream=True
+                )
+                
+                chapter = ""
+                ch_tokens = 0
+                for chunk in response:
+                    if chunk.choices and chunk.choices[0].delta:
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            chapter += content
+                            ch_tokens += 1
+                
+                story_parts.append(chapter)
+                chapter_progress = 0.1 + chapter_num / total_chapters * 0.7
+                update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}/{total_chapters} Completed ({ch_tokens} tokens)")
+            
+            story = "\n\n".join(story_parts)
+
+            # Phase 3: Title
+            update_job_status(job_id, "running", 0.85, "Phase 3: Generating Title...")
+            try:
+                title_prompt = f"Based on the following story outline, create ONE compelling title:\n========\n{outline}\n========\nONLY OUTPUT THE TITLE, NOTHING ELSE!"
+                title_response = llm_client.chat.completions.create(
+                    model=TITLE_MODEL, messages=[{"role": "user", "content": title_prompt}],
+                    max_tokens=30, temperature=0.7
+                )
+                title = title_response.choices[0].message.content.strip().replace('\n', ' ')[:50]
+            except:
+                title = "Untitled-Story"
+            update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
+
+        # Save Files
+        update_job_status(job_id, "running", 0.9, "Saving files...", title=title)
+        filepath, story_dir = save_story(story, title, series_name)
+        tts_filepath = save_tts_story(story, title, story_dir)
+        voices_used = extract_voices_used(story)
+        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used)
         
-        story = "\n\n".join(story_parts)
+        if series_name:
+            add_story_to_series(series_name, title, story_type, reference_story, filepath,
+                               worldbook_path.name if worldbook_path else None)
+            if worldbook_path:
+                update_worldbook_series_link(worldbook_path, series_name)
+        
+        files = [str(filepath), str(story_dir / f"{sanitize_title(title)}.pdf"), str(tts_filepath)]
 
-        # Phase 3: Title
-        status_ph.info("Phase 3: Generating Title...")
-        try:
-            title_prompt = f"Based on the following story outline, create ONE compelling title:\n========\n{outline}\n========\nONLY OUTPUT THE TITLE, NOTHING ELSE!"
-            title_response = llm_client.chat.completions.create(
-                model=TITLE_MODEL, messages=[{"role": "user", "content": title_prompt}],
-                max_tokens=30, temperature=0.7
-            )
-            title = title_response.choices[0].message.content.strip().replace('\n', ' ')[:50]
-        except:
-            title = "Untitled-Story"
-        status_ph.success(f"Generated Title: {title}")
+        # TTS
+        if want_tts:
+            update_job_status(job_id, "running", 0.9, "Generating TTS Audiobook...", title=title)
+            audiobook_path = generate_tts_background(story, title, story_dir, job_id)
+            if audiobook_path:
+                files.append(str(audiobook_path))
+        
+        update_job_status(job_id, "completed", 1.0, "Generation Complete!", files, title)
+        
+    except Exception as e:
+        update_job_status(job_id, "error", 0, str(e))
 
-    # Save Files
-    filepath, story_dir = save_story(story, title, series_name)
-    tts_filepath = save_tts_story(story, title, story_dir)
-    voices_used = extract_voices_used(story)
-    save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used)
-    
-    st.subheader(f"📖 {title}")
-    clean_story = remove_voice_tags(story)
-    st.text_area("Story Content", clean_story, height=400)
-    
-    with open(filepath, "r") as f:
-        st.download_button("Download TXT", f, file_name=f"{title}.txt")
-    with open(story_dir / f"{sanitize_title(title)}.pdf", "rb") as f:
-        st.download_button("Download PDF", f, file_name=f"{title}.pdf")
+def run_tts_worker(job_id, story_path):
+    """Background worker for TTS-only generation"""
+    try:
+        update_job_status(job_id, "running", 0, "Loading story...", job_type="tts")
+        
+        tts_path = story_path.parent / f"{story_path.stem}_tts.txt"
+        if tts_path.exists():
+            with open(tts_path, 'r') as f:
+                story_content = f.read()
+        else:
+            with open(story_path, 'r') as f:
+                story_content = f.read()
+        
+        update_job_status(job_id, "running", 0.1, "Starting TTS generation...", title=story_path.stem)
+        audiobook_path = generate_tts_background(story_content, story_path.stem, story_path.parent, job_id)
+        
+        if audiobook_path:
+            update_job_status(job_id, "completed", 1.0, "TTS Generation Complete!", [str(audiobook_path)], story_path.stem, job_type="tts")
+        else:
+            update_job_status(job_id, "error", 0, "TTS generation failed", job_type="tts")
+    except Exception as e:
+        update_job_status(job_id, "error", 0, str(e), job_type="tts")
 
-    # TTS
-    if want_tts:
-        st.subheader("🎙️ Generating TTS Audiobook...")
-        generate_tts_from_text(story, title, story_dir, status_ph, prog_bar)
+def run_clean_worker(job_id, story_path):
+    """Background worker for cleaning voice tags"""
+    try:
+        update_job_status(job_id, "running", 0, "Loading story...", job_type="clean")
+        
+        with open(story_path, 'r') as f:
+            story_content = f.read()
+        
+        update_job_status(job_id, "running", 0.5, "Removing voice tags...", title=story_path.stem)
+        clean_content = remove_voice_tags(story_content)
+        clean_filepath = story_path.parent / f"{story_path.stem}_cleaned{story_path.suffix}"
+        
+        with open(clean_filepath, 'w') as f:
+            f.write(clean_content)
+        
+        update_job_status(job_id, "completed", 1.0, "Story cleaned successfully!", [str(clean_filepath)], story_path.stem, job_type="clean")
+    except Exception as e:
+        update_job_status(job_id, "error", 0, str(e), job_type="clean")
 
-    st.balloons()
-    st.success(f"🎉 Process completed successfully! Files saved to: {story_dir}")
-
-def generate_tts_from_text(story_text, title, story_dir, status_ph, prog_bar):
+def generate_tts_background(story_text, title, story_dir, job_id):
+    """Generate TTS in background - writes progress to job status"""
     safe_title = sanitize_title(title)
     tts_dir = story_dir / f"{safe_title}_tts_segments"
     tts_dir.mkdir(parents=True, exist_ok=True)
@@ -482,6 +690,9 @@ def generate_tts_from_text(story_text, title, story_dir, status_ph, prog_bar):
     audio_files = []
     total_segments = len(segments)
     
+    short_pause = AudioSegment.silent(duration=300)
+    long_pause = AudioSegment.silent(duration=800)
+    
     for i, segment in enumerate(segments):
         if not segment['text'].strip():
             continue
@@ -489,24 +700,43 @@ def generate_tts_from_text(story_text, title, story_dir, status_ph, prog_bar):
         sentences = [s.strip() for s in re.split(r'[.!?]+', segment['text']) if s.strip()]
         
         for j, sentence in enumerate(sentences):
+            cleaned_sentence = clean_text_for_tts(sentence)
+            if not cleaned_sentence:
+                continue
             try:
                 with tts_client.audio.speech.with_streaming_response.create(
-                    model="kokoro", voice=voice, input=sentence
+                    model="kokoro", voice=voice, input=cleaned_sentence
                 ) as response:
                     audio_file = tts_dir / f"segment_{i:03d}_{j:02d}_{voice}.mp3"
                     response.stream_to_file(str(audio_file))
                     audio_files.append(str(audio_file))
             except Exception as e:
-                status_ph.error(f"TTS Error: {e}")
+                update_job_status(job_id, "running", 0.9, f"TTS Error: {e}")
         
-        prog_bar.progress((i + 1) / total_segments)
-        status_ph.info(f"TTS Generation: {((i+1)/total_segments*100):.1f}% [{voice}]")
+        progress = 0.9 + (i + 1) / total_segments * 0.09
+        update_job_status(job_id, "running", progress, f"TTS Generation: {((i+1)/total_segments*100):.1f}% [{voice}]")
     
-    # Combine
-    status_ph.info("Fusing audio segments...")
+    update_job_status(job_id, "running", 0.99, "Fusing audio segments with pauses...")
     combined = AudioSegment.empty()
-    for audio_file in audio_files:
-        combined += AudioSegment.from_mp3(audio_file)
+    
+    for i, audio_file in enumerate(audio_files):
+        try:
+            audio = AudioSegment.from_mp3(audio_file)
+            combined += audio
+            
+            if i < len(audio_files) - 1:
+                current_parts = Path(audio_file).stem.split('_')
+                next_file = audio_files[i + 1]
+                next_parts = Path(next_file).stem.split('_')
+                
+                if current_parts[1] != next_parts[1]:
+                    combined += long_pause
+                else:
+                    combined += short_pause
+                    
+        except Exception as e:
+            update_job_status(job_id, "running", 0.99, f"Error loading {audio_file}: {e}")
+            continue
     
     audiobook_path = story_dir / f"{safe_title}_audiobook.mp3"
     combined.export(str(audiobook_path), format="mp3")
@@ -516,13 +746,281 @@ def generate_tts_from_text(story_text, title, story_dir, status_ph, prog_bar):
     except:
         pass
     
-    status_ph.success(f"Audiobook saved!")
+    return audiobook_path
+
+# --- Streamlit UI Pages ---
+
+def main():
+    st.set_page_config(page_title="Story Generator", page_icon="📖", layout="wide")
+    ensure_directories()
+
+    st.title("📖 Story Generator")
+    st.markdown("Generate stories with AI, complete with multi-voice TTS audiobook generation.")
+
+    # Check for active jobs and show banner
+    jobs = get_all_jobs()
+    running_jobs = [j for j in jobs if j['status'] == 'running']
+    if running_jobs:
+        st.sidebar.warning(f"⚙️ {len(running_jobs)} job(s) running in background")
+
+    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story"]
+    choice = st.sidebar.selectbox("Menu", menu)
+
+    if choice == "Generate New Story":
+        generate_new_story_page()
+    elif choice == "Job Status":
+        job_status_page()
+    elif choice == "Generate TTS for Existing":
+        generate_tts_existing_page()
+    elif choice == "Story Library":
+        story_library_page()
+    elif choice == "Series Manager":
+        series_manager_page()
+    elif choice == "Worldbook Manager":
+        worldbook_manager_page()
+    elif choice == "Feature Manager":
+        feature_manager_page()
+    elif choice == "Clean Existing Story":
+        clean_existing_story_page()
+
+def generate_new_story_page():
+    st.header("Generate New Story")
     
-    with open(audiobook_path, "rb") as f:
-        st.download_button("Download Audiobook (MP3)", f, file_name=f"{title}_audiobook.mp3", mime="audio/mpeg")
+    # Show current job status if exists
+    if 'current_job_id' in st.session_state:
+        job = get_job_status(st.session_state['current_job_id'])
+        if job:
+            if job['status'] == 'running':
+                st.info(f"🔄 **Active Job:** {job['message']}")
+                st.progress(job['progress'])
+                time.sleep(2)
+                st.rerun()
+            elif job['status'] == 'completed':
+                st.success(f"✅ **Last Job Complete!** {job['message']}")
+                if job.get('files'):
+                    st.write("**Generated files:**")
+                    for file_path in job['files']:
+                        p = Path(file_path)
+                        if p.exists():
+                            if p.suffix == '.txt':
+                                with open(p, 'rb') as f:
+                                    st.download_button(f"Download {p.name}", f, file_name=p.name)
+                            elif p.suffix == '.pdf':
+                                with open(p, 'rb') as f:
+                                    st.download_button(f"Download {p.name}", f, file_name=p.name, mime='application/pdf')
+                            elif p.suffix == '.mp3':
+                                with open(p, 'rb') as f:
+                                    st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg')
+                if st.button("Clear and Start New"):
+                    delete_job(st.session_state['current_job_id'])
+                    del st.session_state['current_job_id']
+                    st.rerun()
+                return
+            elif job['status'] == 'error':
+                st.error(f"❌ **Last Job Failed:** {job['message']}")
+                if st.button("Clear Error"):
+                    delete_job(st.session_state['current_job_id'])
+                    del st.session_state['current_job_id']
+                    st.rerun()
+                return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        topic = st.text_input("Topic", placeholder="Leave blank for AI to decide")
+        genre = st.text_input("Genre", placeholder="Leave blank for AI to decide")
+        story_type = st.selectbox("Story Type", ["standalone", "sequel", "prequel"])
+        
+        reference_story = None
+        series_name = None
+        
+        if story_type in ["sequel", "prequel"]:
+            all_series = get_all_series()
+            if not all_series:
+                st.warning("No series exist yet. Generate a standalone story first or create a series in the Series Manager.")
+            else:
+                series_opts = [s["name"] for s in all_series]
+                selected_series = st.selectbox("Select Series", series_opts)
+                series_name = selected_series
+                
+                series_meta = load_series_metadata(selected_series)
+                if series_meta and series_meta["stories"]:
+                    story_opts = [f"{s['title']} (Book {s['order']})" for s in sorted(series_meta["stories"], key=lambda x: x["order"])]
+                    ref_choice = st.selectbox("Reference Story", story_opts)
+                    ref_title = ref_choice.split(" (Book")[0]
+                    ref_story_meta = next(s for s in series_meta["stories"] if s["title"] == ref_title)
+                    reference_story = Path(SERIES_DIR) / selected_series / ref_story_meta["path"]
+                    if not reference_story.exists():
+                        st.error(f"Reference story file not found: {reference_story}")
+                        reference_story = None
+                else:
+                    st.info("No stories in this series yet. This will be the first story.")
+        else:
+            is_series = st.checkbox("Part of a series?")
+            if is_series:
+                all_series = get_all_series()
+                series_opts = ["Create New Series"] + [s["name"] for s in all_series]
+                s_choice = st.selectbox("Select Series", series_opts)
+                if s_choice == "Create New Series":
+                    series_name = st.text_input("New Series Name")
+                else:
+                    series_name = s_choice
+
+    with col2:
+        worldbooks = get_worldbooks()
+        wb_opts = ["None"] + [wb.stem for wb in worldbooks]
+        wb_choice = st.selectbox("Worldbook", wb_opts)
+        worldbook_path = next((wb for wb in worldbooks if wb.stem == wb_choice), None) if wb_choice != "None" else None
+        
+        if worldbook_path:
+            wb_meta = get_worldbook_metadata(worldbook_path)
+            if wb_meta["linked_series"]:
+                st.info(f"Worldbook linked to series: {', '.join(wb_meta['linked_series'])}")
+            
+            with open(worldbook_path, 'r') as f:
+                wb_content = f.read()
+            char_voices = extract_character_voices(wb_content)
+            if char_voices:
+                st.info(f"Character voices found: {len(char_voices)}")
+                with st.expander("View character voices"):
+                    for char, voice in char_voices.items():
+                        st.write(f"• {char}: {voice}")
+        
+        features = load_features()
+        selected_features = st.multiselect("Required Features", features)
+        
+        length_opts = {
+            "Short (5-8 chapters)": "Keep it short with 5-8 chapters total",
+            "Medium (10-15 chapters)": "Make it medium length with 10-15 chapters total",
+            "Long (20-25 chapters)": "Make it long with 20-25 chapters total",
+            "AI decides": "Decide the optimal chapter count yourself"
+        }
+        length_choice = st.selectbox("Story Length", list(length_opts.keys()))
+        length_instruction = length_opts[length_choice]
+        
+        want_tts = st.checkbox("Generate TTS Audiobook", value=True)
+        debug_mode = st.checkbox("Debug Mode (Use Test Story, skip AI)")
+    
+    if st.button("🚀 Generate Story", type="primary"):
+        job_id = str(int(time.time()))
+        
+        thread = threading.Thread(
+            target=run_generation_worker,
+            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        st.session_state['current_job_id'] = job_id
+        st.success(f"✅ Generation started in background! Job ID: {job_id}")
+        st.rerun()
+
+def job_status_page():
+    st.header("⚙️ Background Jobs")
+    
+    jobs = get_all_jobs()
+    
+    if not jobs:
+        st.info("No background jobs found.")
+        return
+    
+    # Sort by timestamp (newest first)
+    jobs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    
+    # Check for running jobs and auto-refresh
+    running_jobs = [j for j in jobs if j['status'] == 'running']
+    if running_jobs:
+        st.info(f"🔄 {len(running_jobs)} job(s) running. Auto-refreshing in 2 seconds...")
+        time.sleep(2)
+        st.rerun()
+    
+    for job in jobs:
+        job_id = job.get('job_id', 'unknown')
+        job_type = job.get('job_type', 'story')
+        title = job.get('title', 'In Progress...')
+        
+        status_icon = {
+            'running': '🔄',
+            'completed': '✅',
+            'error': '❌'
+        }.get(job['status'], '❓')
+        
+        with st.expander(f"{status_icon} Job {job_id} - {title} ({job['status'].title()})", expanded=(job['status'] == 'running')):
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                st.write(f"**Type:** {job_type.title()}")
+                st.write(f"**Status:** {job['status'].title()}")
+                st.write(f"**Message:** {job['message']}")
+                st.write(f"**Last Updated:** {job.get('timestamp', 'Unknown')}")
+            
+            with col2:
+                if job['status'] == 'running':
+                    st.metric("Progress", f"{job['progress']*100:.1f}%")
+                elif job['status'] == 'completed':
+                    st.metric("Files", len(job.get('files', [])))
+                elif job['status'] == 'error':
+                    st.metric("Error", "Failed")
+            
+            if job['status'] == 'running':
+                st.progress(job['progress'])
+            elif job['status'] == 'completed':
+                st.success("✅ Generation Complete!")
+                for file_path in job.get('files', []):
+                    p = Path(file_path)
+                    if p.exists():
+                        if p.suffix == '.txt':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.pdf':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='application/pdf', key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.mp3':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg', key=f"dl_{job_id}_{p.name}")
+                
+                if st.button(f"Clear Job", key=f"clear_{job_id}"):
+                    delete_job(job_id)
+                    st.rerun()
+            elif job['status'] == 'error':
+                st.error(f"❌ Error: {job['message']}")
+                if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
+                    delete_job(job_id)
+                    st.rerun()
 
 def generate_tts_existing_page():
     st.header("Generate TTS for Existing Story")
+    
+    # Show current job status if exists
+    if 'current_tts_job_id' in st.session_state:
+        job = get_job_status(st.session_state['current_tts_job_id'])
+        if job:
+            if job['status'] == 'running':
+                st.info(f"🔄 **Active Job:** {job['message']}")
+                st.progress(job['progress'])
+                time.sleep(2)
+                st.rerun()
+            elif job['status'] == 'completed':
+                st.success(f"✅ **TTS Complete!** {job['message']}")
+                if job.get('files'):
+                    for file_path in job['files']:
+                        p = Path(file_path)
+                        if p.exists() and p.suffix == '.mp3':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg')
+                if st.button("Clear and Start New"):
+                    delete_job(st.session_state['current_tts_job_id'])
+                    del st.session_state['current_tts_job_id']
+                    st.rerun()
+                return
+            elif job['status'] == 'error':
+                st.error(f"❌ **Job Failed:** {job['message']}")
+                if st.button("Clear Error"):
+                    delete_job(st.session_state['current_tts_job_id'])
+                    del st.session_state['current_tts_job_id']
+                    st.rerun()
+                return
+    
     stories = get_all_stories()
     if not stories:
         st.warning("No stories found.")
@@ -533,20 +1031,19 @@ def generate_tts_existing_page():
     
     if st.button("Generate TTS", type="primary"):
         selected_file = next(s for s in stories if str(s.relative_to(Path(OUTPUT_DIR).parent)) == selected)
-        tts_path = selected_file.parent / f"{selected_file.stem}_tts.txt"
         
-        if tts_path.exists():
-            with open(tts_path, 'r') as f:
-                story_content = f.read()
-            st.info("Using tagged version for TTS.")
-        else:
-            with open(selected_file, 'r') as f:
-                story_content = f.read()
-            st.info("No tagged version found, using clean version.")
+        job_id = f"tts_{int(time.time())}"
         
-        status_ph = st.empty()
-        prog_bar = st.progress(0)
-        generate_tts_from_text(story_content, selected_file.stem, selected_file.parent, status_ph, prog_bar)
+        thread = threading.Thread(
+            target=run_tts_worker,
+            args=(job_id, selected_file)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        st.session_state['current_tts_job_id'] = job_id
+        st.success(f"✅ TTS generation started in background! Job ID: {job_id}")
+        st.rerun()
 
 def story_library_page():
     st.header("📚 Story Library")
@@ -566,7 +1063,6 @@ def story_library_page():
     st.subheader(selected_file.stem)
     st.text_area("Content", story_content, height=500)
     
-    # Check for audiobook
     audiobook_path = selected_file.parent / f"{selected_file.stem}_audiobook.mp3"
     if audiobook_path.exists():
         st.subheader("🎙️ Audiobook")
@@ -574,6 +1070,131 @@ def story_library_page():
         
         with open(audiobook_path, "rb") as f:
             st.download_button("Download Audiobook", f, file_name=f"{selected_file.stem}_audiobook.mp3", mime="audio/mpeg")
+
+def series_manager_page():
+    st.header("📚 Series Manager")
+    
+    tab1, tab2, tab3 = st.tabs(["View Series", "Create New Series", "Add Existing Story"])
+    
+    with tab1:
+        st.subheader("View All Series")
+        all_series = get_all_series()
+        
+        if not all_series:
+            st.info("No series found. Create one in the 'Create New Series' tab!")
+        else:
+            for series in all_series:
+                with st.expander(f"📖 {series['name']} ({len(series['stories'])} stories)"):
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        st.write(f"**Worldbook:** {series.get('worldbook', 'None')}")
+                        st.write(f"**Created:** {series.get('created', 'Unknown')}")
+                        
+                        if series.get('stories'):
+                            st.write("**Stories (in order):**")
+                            for story in sorted(series['stories'], key=lambda x: x["order"]):
+                                st.write(f"{story['order']}. {story['title']} ({story['type']})")
+                                if story.get('reference'):
+                                    st.write(f"   ↳ References: {story['reference']}")
+                        else:
+                            st.write("*No stories yet*")
+                    
+                    with col2:
+                        new_name = st.text_input("Rename", value=series['name'], key=f"rename_{series['name']}")
+                        if st.button("Rename", key=f"rename_btn_{series['name']}"):
+                            if new_name != series['name'] and new_name.strip():
+                                old_path = Path(SERIES_DIR) / series['name']
+                                new_path = Path(SERIES_DIR) / new_name
+                                old_path.rename(new_path)
+                                series['name'] = new_name
+                                save_series_metadata(new_name, series)
+                                st.success(f"Renamed to {new_name}")
+                                st.rerun()
+    
+    with tab2:
+        st.subheader("Create New Series")
+        
+        new_series_name = st.text_input("Series Name", key="new_series_name_input")
+        
+        worldbooks = get_worldbooks()
+        wb_opts = ["None"] + [wb.stem for wb in worldbooks]
+        wb_choice = st.selectbox("Link to Worldbook", wb_opts, key="new_series_wb")
+        
+        if st.button("Create Series", type="primary", key="create_series_btn"):
+            if new_series_name and new_series_name.strip():
+                series_dir = Path(SERIES_DIR) / new_series_name
+                series_dir.mkdir(parents=True, exist_ok=True)
+                
+                meta = {
+                    "name": new_series_name,
+                    "worldbook": f"{wb_choice}.txt" if wb_choice != "None" else None,
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "stories": []
+                }
+                save_series_metadata(new_series_name, meta)
+                
+                if wb_choice != "None":
+                    wb_path = next(wb for wb in worldbooks if wb.stem == wb_choice)
+                    update_worldbook_series_link(wb_path, new_series_name)
+                
+                st.success(f"Series created: {new_series_name}")
+                st.rerun()
+            else:
+                st.error("Series name is required.")
+    
+    with tab3:
+        st.subheader("Add Existing Story to Series")
+        
+        stories = get_all_stories()
+        if not stories:
+            st.info("No stories found. Generate one first!")
+            return
+        
+        all_series = get_all_series()
+        if not all_series:
+            st.info("No series exist yet. Create one in the 'Create New Series' tab.")
+            return
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**Select Story to Move:**")
+            story_opts = [str(s.relative_to(Path(OUTPUT_DIR).parent)) for s in stories]
+            selected_story = st.selectbox("Story", story_opts, key="move_story_select")
+        
+        with col2:
+            st.write("**Select Target Series:**")
+            series_opts = [s["name"] for s in all_series]
+            selected_series = st.selectbox("Series", series_opts, key="move_series_select")
+            
+            series_meta = load_series_metadata(selected_series)
+            if series_meta and series_meta.get('stories'):
+                ref_opts = ["None"] + [f"{s['title']} (Book {s['order']})" for s in sorted(series_meta["stories"], key=lambda x: x["order"])]
+                ref_choice = st.selectbox("Reference Story (optional)", ref_opts, key="move_ref_select")
+            else:
+                ref_choice = "None"
+                st.info("No stories in this series yet.")
+            
+            story_type = st.selectbox("Story Type", ["standalone", "sequel", "prequel"], key="move_type_select")
+        
+        if st.button("Move Story to Series", type="primary", key="move_story_btn"):
+            story_path = next(s for s in stories if str(s.relative_to(Path(OUTPUT_DIR).parent)) == selected_story)
+            
+            reference = None
+            if ref_choice != "None":
+                ref_title = ref_choice.split(" (Book")[0]
+                ref_meta = next(s for s in series_meta["stories"] if s["title"] == ref_title)
+                reference = Path(SERIES_DIR) / selected_series / ref_meta["path"]
+            
+            success, result = add_existing_story_to_series(story_path, selected_series, story_type, reference)
+            
+            if success:
+                st.success(f"Story moved to series '{selected_series}'!")
+                st.info(f"New location: {result}")
+                st.rerun()
+            else:
+                st.error(result)
 
 def worldbook_manager_page():
     st.header("🌍 Worldbook Manager")
@@ -583,7 +1204,15 @@ def worldbook_manager_page():
     with tab1:
         st.subheader("Create New Worldbook")
         name = st.text_input("Worldbook Name (filename)", key="new_wb_name")
-        content = st.text_area("Worldbook Content", height=300, key="new_wb_content")
+        
+        st.markdown("**Tip:** You can define character voices by adding a `[CHARACTER VOICES]` section at the end of your worldbook:")
+        st.code("""[CHARACTER VOICES]
+John Doe: am_adam
+Jane Smith: af_bella
+Narrator: af_heart""", language="text")
+        
+        content = st.text_area("Worldbook Content", height=300, key="new_wb_content",
+                              placeholder="Enter world lore, locations, history, character descriptions...\n\n[CHARACTER VOICES]\nCharacter Name: voice_name")
         
         if st.button("Save Worldbook", type="primary", key="save_new_wb"):
             if name and content:
@@ -591,6 +1220,7 @@ def worldbook_manager_page():
                 with open(worldbook_path, 'w') as f:
                     f.write(content)
                 st.success(f"Worldbook saved: {worldbook_path}")
+                st.rerun()
             else:
                 st.error("Name and content are required.")
     
@@ -608,12 +1238,25 @@ def worldbook_manager_page():
         with open(wb_path, 'r') as f:
             current_content = f.read()
         
-        edited_content = st.text_area("Edit Content", current_content, height=300, key="edit_wb_content")
+        wb_meta = get_worldbook_metadata(wb_path)
+        if wb_meta["linked_series"]:
+            st.info(f"**Linked series:** {', '.join(wb_meta['linked_series'])}")
+        
+        char_voices = extract_character_voices(current_content)
+        if char_voices:
+            st.success(f"**Character voices detected:** {len(char_voices)}")
+            for char, voice in char_voices.items():
+                st.write(f"• {char}: {voice}")
+        else:
+            st.warning("No [CHARACTER VOICES] section found. Add one to assign consistent voices to characters.")
+        
+        edited_content = st.text_area("Edit Content", current_content, height=400, key="edit_wb_content")
         
         if st.button("Update Worldbook", type="primary", key="update_wb"):
             with open(wb_path, 'w') as f:
                 f.write(edited_content)
             st.success(f"Worldbook updated: {wb_path}")
+            st.rerun()
 
 def feature_manager_page():
     st.header("✨ Feature Manager")
@@ -632,6 +1275,37 @@ def feature_manager_page():
 
 def clean_existing_story_page():
     st.header("🧹 Clean Existing Story (Remove Voice Tags)")
+    
+    # Show current job status if exists
+    if 'current_clean_job_id' in st.session_state:
+        job = get_job_status(st.session_state['current_clean_job_id'])
+        if job:
+            if job['status'] == 'running':
+                st.info(f"🔄 **Active Job:** {job['message']}")
+                st.progress(job['progress'])
+                time.sleep(2)
+                st.rerun()
+            elif job['status'] == 'completed':
+                st.success(f"✅ **Cleaning Complete!** {job['message']}")
+                if job.get('files'):
+                    for file_path in job['files']:
+                        p = Path(file_path)
+                        if p.exists():
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name)
+                if st.button("Clear and Start New"):
+                    delete_job(st.session_state['current_clean_job_id'])
+                    del st.session_state['current_clean_job_id']
+                    st.rerun()
+                return
+            elif job['status'] == 'error':
+                st.error(f"❌ **Job Failed:** {job['message']}")
+                if st.button("Clear Error"):
+                    delete_job(st.session_state['current_clean_job_id'])
+                    del st.session_state['current_clean_job_id']
+                    st.rerun()
+                return
+    
     stories = get_all_stories()
     if not stories:
         st.warning("No stories found.")
@@ -642,17 +1316,19 @@ def clean_existing_story_page():
     
     if st.button("Clean Story", type="primary"):
         selected_file = next(s for s in stories if str(s.relative_to(Path(OUTPUT_DIR).parent)) == selected)
-        with open(selected_file, 'r') as f:
-            story_content = f.read()
         
-        clean_content = remove_voice_tags(story_content)
-        clean_filepath = selected_file.parent / f"{selected_file.stem}_cleaned{selected_file.suffix}"
+        job_id = f"clean_{int(time.time())}"
         
-        with open(clean_filepath, 'w') as f:
-            f.write(clean_content)
+        thread = threading.Thread(
+            target=run_clean_worker,
+            args=(job_id, selected_file)
+        )
+        thread.daemon = True
+        thread.start()
         
-        st.success(f"Cleaned story saved: {clean_filepath}")
-        st.text_area("Cleaned Content Preview", clean_content, height=300)
+        st.session_state['current_clean_job_id'] = job_id
+        st.success(f"✅ Cleaning started in background! Job ID: {job_id}")
+        st.rerun()
 
 if __name__ == "__main__":
     main()
