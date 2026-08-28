@@ -7,7 +7,7 @@ import json
 import re
 import shutil
 import threading
-from spire.doc import *
+from fpdf import FPDF
 from dotenv import load_dotenv
 from pydub import AudioSegment
 import requests
@@ -121,25 +121,22 @@ def ensure_directories():
         Path(directory).mkdir(parents=True, exist_ok=True)
 
 def string_to_pdf(string, outputFullPath):
-    document = Document()
-    section = document.AddSection()
-    section.PageSetup.Margins.All = 72
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=72)
+    pdf.set_font("Helvetica", size=12)
+    pdf.set_text_color(34, 34, 34)
     
     paragraphs = [p.strip() for p in string.split('\n\n') if p.strip()]
     if not paragraphs:
         paragraphs = [string]
     
     for i, para in enumerate(paragraphs):
-        p = section.AddParagraph()
-        text_range = p.AppendText(para)
-        text_range.CharacterFormat.FontName = "Arial"
-        text_range.CharacterFormat.FontSize = 12
-        text_range.CharacterFormat.TextColor = Color.FromRgb(34, 34, 34)
-        if i > 0:
-            p.Format.SpaceAfter = 6
+        pdf.multi_cell(0, 10, para)
+        if i < len(paragraphs) - 1:
+            pdf.ln(6)
     
-    document.SaveToFile(outputFullPath, FileFormat.PDF)
-    document.Close()
+    pdf.output(outputFullPath)
 
 def clean_text_for_tts(text):
     text = text.replace('"', '').replace('"', '').replace('"', '')
