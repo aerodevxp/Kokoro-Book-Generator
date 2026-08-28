@@ -13,3 +13,4 @@ ffmpeg
 audioio
 audioop-lts
 streamlit
+requests
