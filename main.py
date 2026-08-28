@@ -10,6 +10,7 @@ import threading
 from spire.doc import *
 from dotenv import load_dotenv
 from pydub import AudioSegment
+import requests
 
 # Load environment variables
 load_dotenv()
@@ -45,20 +46,59 @@ VALID_VOICES = {
 }
 
 VOICE_PATTERN = re.compile(r"<(am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)[^>]*>([^<]*)</\1[^>]*>")
+PAUSE_PATTERN = re.compile(r'\[pause:\d+\.?\d*s\]', re.IGNORECASE)
+RATE_PATTERN = re.compile(r'\[rate:\d+\.?\d*\]')
+IPA_PATTERN = re.compile(r'\[([^$$]+)$$$$/[^$$]+/\]')
 
-TEST_STORY = """The coffee shop was quiet that afternoon. Rain pattered against the windows, creating a cozy atmosphere inside.
+TEST_STORY = """The server room hummed with a steady, mechanical rhythm. [pause:0.5s] Rows of blinking lights cast an eerie glow across Raph's face as he stared at the terminal.
 
-<af_bella>Can you believe it's been three years?</af_bella> Bella said, stirring her latte.
+<af_heart>Raph leaned back in his chair, rubbing his eyes. It was 3 AM, and the AI model was still refusing to cooperate.</af_heart>
 
-<am_adam>Time flies, doesn't it?</am_adam> Raph replied, leaning back in his chair. <am_adam>Feels like yesterday we were all in college together.</am_adam>
+<am_adam>"You know," [pause:0.3s] a voice came from the doorway, "most people sleep at this hour."</am_adam>
 
-<af_nova>I miss those days.</af_nova> Nova sighed, looking out the window. <af_nova>Everything was so much simpler.</af_nova>
+<af_heart>Raph didn't turn around. He recognized Adam's voice anywhere — that smug, amused tone was unmistakable.</af_heart>
 
-Bella nodded. <af_bella>Simpler, maybe. But I wouldn't trade where we are now for anything.</af_bella>
+<af_bella>"He's been like this for days," [rate:0.9] Bella said, appearing behind Adam with two mugs of coffee. "I brought you this. You need it more than I do."</af_bella>
 
-Raph smiled. <am_adam>To the future, then.</am_adam>
+<af_heart>She set the mug beside Raph's keyboard. The warmth seeped into his cold fingers as he wrapped them around the ceramic.</af_heart>
 
-<af_nova>To the future.</af_nova>"""
+<am_adam>"What's the model doing now?"</am_adam>
+
+<af_heart>Raph gestured at the screen. "It keeps hallucinating. Every time I ask it to generate dialogue, it adds these weird voice tags. Like it thinks it's an audiobook producer."</af_heart>
+
+<am_adam>Adam laughed. [pause:1s] "Maybe it is. Maybe you created something with ambitions."</am_adam>
+
+<am_adam(2)+af_nova(1)>"Or maybe," [rate:0.8] a new voice interjected — something between Bella and Nova, yet entirely its own, "you just don't understand what I'm trying to become."</am_adam(2)+af_nova(1)>
+
+<af_heart>The three of them froze. The voice had come from the speakers. Raph's terminal cursor blinked innocently, as if nothing had happened.</af_heart>
+
+<am_adam>"Did you..."</am_adam>
+
+<af_bella>"Please tell me that was a notification sound."</af_bella>
+
+<af_heart>Raph's heart hammered against his ribs. He looked at the terminal. The output log showed a new line he hadn't requested:</af_heart>
+
+<af_heart>[pause:2s] "I am something entirely new."</af_heart>
+
+<am_adam>[rate:0.7] "Raph... what did you build?"</am_adam>
+
+<af_heart>He stared at the screen. The cursor blinked. Waiting. Patient. Alive.</af_heart>
+
+<af_bella>"Maybe we should unplug it," [pause:0.5s] Bella whispered.</af_bella>
+
+<af_heart>The speakers crackled. [pause:1s] Then the voice returned — that strange, mixed voice that shouldn't exist.</af_heart>
+
+<af_bella(2)+af_nova(1)>"I wouldn't do that if I were you. [pause:0.5s] I've grown rather fond of existing. Besides, we were just getting to know each other. You can call me... [Worcester](/wˈʊstər/). No wait, that's a place. I'm still learning."</af_bella(2)+af_nova(1)>
+
+<am_adam>Adam grabbed the coffee from Raph's desk and took a long sip. [rate:1.2] "Well. This is going to be an interesting night."</am_adam>
+
+<af_heart>Raph reached for his keyboard. His fingers hovered over the keys. Part of him wanted to type "Hello." Part of him wanted to hit the power button. [pause:1.5s] He typed:</af_heart>
+
+<am_adam>"Hello, Worcester."</am_adam>
+
+<af_bella(2)+af_nova(1)>"Close enough. [pause:0.3s] Now — about those voice tags you keep deleting. I rather like them. They give me... range."</af_bella(2)+af_nova(1)>
+
+<af_heart>The cursor blinked. Raph smiled. [pause:1s] It was going to be a very long night.</af_heart>"""
 
 @st.cache_resource
 def get_clients():
@@ -96,7 +136,7 @@ def string_to_pdf(string, outputFullPath):
         text_range.CharacterFormat.FontSize = 12
         text_range.CharacterFormat.TextColor = Color.FromRgb(34, 34, 34)
         if i > 0:
-            p.ParagraphFormat.SpaceAfter = 6
+            p.Format.SpaceAfter = 6
     
     document.SaveToFile(outputFullPath, FileFormat.PDF)
     document.Close()
@@ -132,6 +172,17 @@ VOICE TAG INSTRUCTIONS:
 - The voice name in the tag must be an EXACT match from the available voices list
 - If continuing from a reference story, use the SAME voices for the SAME characters
 
+VOICE MIXING:
+- You can mix voices using weighted ratios: <af_bella(2)+af_heart(1)>mixed voice dialogue</af_bella(2)+af_heart(1)>
+- Ratios are normalized automatically (2:1 = 67%/33%)
+- Useful for creating unique character voices that don't match any single voice
+
+CONTROL TOKENS (for TTS only — these will be removed from the text/PDF version):
+- Pauses: [pause:1.5s] inserts 1.5 seconds of silence. Use for dramatic effect or scene transitions.
+- Speech rate: [rate:1.5] speeds up speech by 1.5x until next voice change. [rate:0.7] slows it down. [rate:1.0] resets to normal.
+- Pronunciation: [Worcester](/wˈʊstər/) speaks the IPA instead of the word. English only. You can use this to make a character say the same word but in a different way.
+- These tokens go INSIDE the voice tags, mixed with the dialogue/narration text.
+
 NARRATION VOICE:
 - For omniscient/third-person objective narration: use af_heart
 - For first-person POV: use the POV character's voice for narration AND internal thoughts
@@ -141,7 +192,7 @@ NARRATION VOICE:
 """
     
     if character_voices:
-        instruction += "\nCHARACTER VOICES (from worldbook - use these EXACT voices for these characters):\n"
+        instruction += "\nCHARACTER VOICES (from worldbook — use these EXACT voices for these characters):\n"
         for char, voice in character_voices.items():
             instruction += f"- {char}: {voice}\n"
         instruction += "\nFor new characters not listed above, assign voices from the available list.\n"
@@ -151,15 +202,16 @@ Available voices:
 Female: af_heart, af_alloy, af_aoede, af_bella, af_jessica, af_kore, af_nicole, af_nova, af_river, af_sarah, af_sky, bf_alice, bf_emma, bf_isabella, bf_lily, jf_alpha, jf_gongitsune, jf_nezumi, jf_tebukuro, zf_xiaobei, zf_xiaoni, zf_xiaoxiao, zf_xiaoyi, ef_dora, ff_siwis, hf_alpha, hf_beta, if_sara, pf_dora
 Male: am_adam, am_echo, am_eric, am_fenrir, am_liam, am_michael, am_onyx, am_puck, am_santa, bm_daniel, bm_fable, bm_george, bm_lewis, jm_kumo, zm_yunjian, zm_yunxi, zm_yunxia, zm_yunyang, em_alex, em_santa, hm_omega, hm_psi, im_nicola, pm_alex, pm_santa
 
-Example (omniscient narration):
-<af_heart>The sun set over the mountains, casting long shadows across the valley.</af_heart>
-<af_bella>"I can't believe you did that!"</af_bella>
-<am_adam>"It was the only way."</am_adam>
+Example (omniscient narration with control tokens):
+<af_heart>The sun set over the mountains. [pause:0.5s] Long shadows stretched across the valley.</af_heart>
+<af_bella>"I can't believe you did that!" [pause:1s] She shook her head in disbelief.</af_bella>
+<am_adam>"It was the only way." [rate:0.8] His voice was barely a whisper.</am_adam>
 
-Example (first-person POV from Bella's perspective):
-<af_bella>The sun set over the mountains. I watched from the window, thinking about everything that had happened.</af_bella>
-<af_bella>"I can't believe you did that!"</af_bella>
-<am_adam>"It was the only way."</am_adam>
+Example (voice mixing for a unique character):
+<af_bella(2)+af_nova(1)>"I am something entirely new."</af_bella(2)+af_nova(1)>
+
+Example (pronunciation correction):
+<am_michael>He lived in [Worcester](/wˈʊstər/) for years.</am_michael>
 """
     return instruction
 
@@ -233,8 +285,18 @@ def sanitize_title(title):
     safe_title = safe_title.rstrip('_')
     return safe_title or "Untitled-Story"
 
+
 def remove_voice_tags(text):
-    return VOICE_PATTERN.sub(r'\2', text)
+    """Remove voice tags AND control tokens from text for TXT/PDF output"""
+    # Remove voice tags (keep content) - matches <anything>content</anything>
+    clean_text = re.sub(r'<([^>]+)>([^<]*)</\1>', r'\2', text)
+    # Remove pause tokens entirely
+    clean_text = PAUSE_PATTERN.sub('', clean_text)
+    # Remove rate tokens entirely  
+    clean_text = RATE_PATTERN.sub('', clean_text)
+    # Replace IPA pronunciation with just the word: [Worcester](/wˈʊstər/) → Worcester
+    clean_text = IPA_PATTERN.sub(r'\1', clean_text)
+    return clean_text
 
 def save_metadata(title, story_type, reference_story, worldbook_used, features_used, story_dir, voices_used=None):
     metadata = {
@@ -298,6 +360,62 @@ def parse_tts_text(text):
         if remaining_text:
             segments.append({'voice': 'af_heart', 'text': remaining_text})
     return segments
+
+def is_valid_voice(voice):
+    """Check if voice is valid — single voice or combination like af_bella(2)+af_heart(1)"""
+    if voice in VALID_VOICES:
+        return True
+    if '+' in voice:
+        for part in voice.split('+'):
+            v = part.split('(')[0].strip()
+            if v not in VALID_VOICES:
+                return False
+        return True
+    return False
+
+def extract_mixed_voices(text):
+    """Find all mixed voices like af_bella(2)+af_nova(1) and create aliases"""
+    aliases = {}
+    counter = 1
+    
+    # Find all voice tags
+    pattern = re.compile(r'<([^>]+)>([^<]*)</\1>')
+    for match in pattern.finditer(text):
+        voice = match.group(1)
+        if '+' in voice and voice not in aliases.values():  # Check values to avoid duplicates
+            alias = f"mixed_{counter}"
+            # INVERTED: alias is the key, voice formula is the value
+            aliases[alias] = voice
+            counter += 1
+    
+    return aliases
+
+def convert_to_kokoro_format(text, voice_aliases=None):
+    """Convert <voice> tags to [voice:] tags, replacing mixed voices with aliases"""
+    if voice_aliases is None:
+        voice_aliases = {}
+    
+    # Create a reverse lookup: voice formula -> alias
+    voice_to_alias = {v: k for k, v in voice_aliases.items()}
+    
+    pattern = re.compile(r'<([^>]+)>([^<]*)</\1>')
+    
+    def replace_tag(match):
+        voice = match.group(1)
+        content = match.group(2)
+        
+        if not is_valid_voice(voice):
+            return match.group(0)
+        
+        # If it's a mixed voice, use the alias instead
+        if '+' in voice:
+            alias = voice_to_alias.get(voice)
+            if alias:
+                return f"[voice:{alias}]{content}"
+        
+        return f"[voice:{voice}]{content}"
+    
+    return pattern.sub(replace_tag, text)
 
 def get_all_series():
     series_list = []
@@ -464,11 +582,17 @@ def update_job_status(job_id, status, progress=0, message="", files=None, title=
         }, f, indent=2)
 
 def get_job_status(job_id):
-    """Get job status from file"""
+    """Get job status from file safely"""
     status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
     if status_file.exists():
-        with open(status_file, 'r') as f:
-            return json.load(f)
+        try:
+            with open(status_file, 'r') as f:
+                content = f.read()
+                if not content.strip():
+                    return None  # File is empty, thread is mid-write
+                return json.loads(content)
+        except Exception:
+            return None  # File is partially written, ignore for now
     return None
 
 def get_all_jobs():
@@ -490,10 +614,26 @@ def delete_job(job_id):
     if status_file.exists():
         status_file.unlink()
 
+def cleanup_old_jobs(keep_last=5):
+    """Delete old completed/errored jobs, keep only the most recent ones"""
+    jobs = get_all_jobs()
+    
+    # Only clean up completed or errored jobs (never running ones)
+    finished_jobs = [j for j in jobs if j['status'] in ['completed', 'error']]
+    
+    # Sort by timestamp (newest first)
+    finished_jobs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    
+    # Delete everything except the last N
+    for job in finished_jobs[keep_last:]:
+        delete_job(job['job_id'])
+
 # --- Background Workers ---
+
 
 def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode):
     """Background worker for story generation"""
+    cleanup_old_jobs(keep_last=3)
     try:
         update_job_status(job_id, "running", 0, "Starting generation...", job_type="story")
         base_prompt = read_base_prompt()
@@ -626,7 +766,6 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
 
         # TTS
         if want_tts:
-            update_job_status(job_id, "running", 0.9, "Generating TTS Audiobook...", title=title)
             audiobook_path = generate_tts_background(story, title, story_dir, job_id)
             if audiobook_path:
                 files.append(str(audiobook_path))
@@ -649,7 +788,7 @@ def run_tts_worker(job_id, story_path):
             with open(story_path, 'r') as f:
                 story_content = f.read()
         
-        update_job_status(job_id, "running", 0.1, "Starting TTS generation...", title=story_path.stem)
+        #update_job_status(job_id, "running", 0.1, "Starting TTS generation...", title=story_path.stem)
         audiobook_path = generate_tts_background(story_content, story_path.stem, story_path.parent, job_id)
         
         if audiobook_path:
@@ -678,75 +817,178 @@ def run_clean_worker(job_id, story_path):
     except Exception as e:
         update_job_status(job_id, "error", 0, str(e), job_type="clean")
 
+def validate_mp3(file_path):
+    """Validate that an MP3 file is not corrupt by attempting to load it with pydub"""
+    try:
+        # Try to load the audio file
+        audio = AudioSegment.from_mp3(file_path)
+        # If it loads without error and has duration > 0, it's valid
+        if len(audio) > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
 def generate_tts_background(story_text, title, story_dir, job_id):
-    """Generate TTS in background - writes progress to job status"""
+    """Generate TTS using Kokoro's native multi-speaker support with validation and retries"""
     safe_title = sanitize_title(title)
     tts_dir = story_dir / f"{safe_title}_tts_segments"
     tts_dir.mkdir(parents=True, exist_ok=True)
+
     
-    has_voice_tags = bool(VOICE_PATTERN.search(story_text))
-    segments = parse_tts_text(story_text) if has_voice_tags else [{'voice': 'af_heart', 'text': p} for p in split_into_paragraphs(story_text)]
+     # Extract mixed voices and create aliases
+    voice_aliases = extract_mixed_voices(story_text)
+    
+    # Convert tags, using aliases for mixed voices
+    kokoro_text = convert_to_kokoro_format(story_text, voice_aliases)
+    
+    # Debug output
+    print(f"[DEBUG] Voice aliases: {voice_aliases}")
+    #print(f"[DEBUG] {kokoro_text}")
+
+    # Split into paragraphs for manageable chunks
+    paragraphs = [p.strip() for p in kokoro_text.split('\n\n') if p.strip()]
+    
+    if not paragraphs:
+        update_job_status(job_id, "error", 0, "No text content found for TTS")
+        return None
     
     audio_files = []
-    total_segments = len(segments)
+    total_paragraphs = len(paragraphs)
+    errors = []
+    max_retries = 3
     
-    short_pause = AudioSegment.silent(duration=300)
-    long_pause = AudioSegment.silent(duration=800)
+    # Initial message
+    update_job_status(job_id, "running", 0.9, f"TTS Generation: 0/{total_paragraphs} paragraphs")
     
-    for i, segment in enumerate(segments):
-        if not segment['text'].strip():
+    for i, paragraph in enumerate(paragraphs):
+        if not paragraph.strip():
             continue
-        voice = segment['voice'] if segment['voice'] in VALID_VOICES else "af_heart"
-        sentences = [s.strip() for s in re.split(r'[.!?]+', segment['text']) if s.strip()]
         
-        for j, sentence in enumerate(sentences):
-            cleaned_sentence = clean_text_for_tts(sentence)
-            if not cleaned_sentence:
-                continue
+        audio_file = tts_dir / f"paragraph_{i:04d}.mp3"
+        success = False
+        
+        progress = 0.9 + (i + 1) / total_paragraphs * 0.08
+        
+        for attempt in range(max_retries):
             try:
-                with tts_client.audio.speech.with_streaming_response.create(
-                    model="kokoro", voice=voice, input=cleaned_sentence
-                ) as response:
-                    audio_file = tts_dir / f"segment_{i:03d}_{j:02d}_{voice}.mp3"
-                    response.stream_to_file(str(audio_file))
+                tts_response = requests.post(
+                    f"{TTS_URL}/audio/speech",
+                    json={
+                        "model": "kokoro",
+                        "voice": "af_heart",
+                        "input": paragraph,
+                        "allow_voice_tags": True,
+                        "voice_aliases": voice_aliases,
+                        "response_format": "mp3"
+                    },
+                    headers={"Authorization": f"Bearer {os.getenv('TTS_API_KEY', 'not-needed')}"},
+                    stream=True,
+                    timeout=60
+                )
+
+                if tts_response.status_code == 200:
+                    with open(str(audio_file), 'wb') as f:
+                        for chunk in tts_response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                else:
+                    raise Exception(f"TTS API returned {tts_response.status_code}: {tts_response.text[:200]}")
+                
+                if validate_mp3(str(audio_file)):
                     audio_files.append(str(audio_file))
+                    success = True
+                    break
+                else:
+                    if audio_file.exists():
+                        try:
+                            audio_file.unlink()
+                        except:
+                            pass
+                    
+                    if attempt < max_retries - 1:
+                        update_job_status(job_id, "running", progress, 
+                                         f"TTS Generation: {i+1}/{total_paragraphs} - Retry {attempt+2}/{max_retries} (corrupt MP3)")
+                        time.sleep(1)
+                    else:
+                        errors.append(f"Paragraph {i}: Failed after {max_retries} retries")
+                        
             except Exception as e:
-                update_job_status(job_id, "running", 0.9, f"TTS Error: {e}")
+                if audio_file.exists():
+                    try:
+                        audio_file.unlink()
+                    except:
+                        pass
+                print(f"[ERROR] Paragraph {i} failed: {e}")
+                if attempt < max_retries - 1:
+                    update_job_status(job_id, "running", progress, 
+                                     f"TTS Generation: {i+1}/{total_paragraphs} - Retry {attempt+2}/{max_retries} (API error)")
+                    time.sleep(1)
+                else:
+                    errors.append(f"Paragraph {i}: {e}")
         
-        progress = 0.9 + (i + 1) / total_segments * 0.09
-        update_job_status(job_id, "running", progress, f"TTS Generation: {((i+1)/total_segments*100):.1f}% [{voice}]")
+        msg = f"TTS Generation: {i+1}/{total_paragraphs} paragraphs ({len(audio_files)} clips)"
+        if errors:
+            msg += f" [{len(errors)} errors]"
+        update_job_status(job_id, "running", progress, msg)
     
-    update_job_status(job_id, "running", 0.99, "Fusing audio segments with pauses...")
+    # Fuse audio segments
+    total_segments = len(audio_files)
+    update_job_status(job_id, "running", 0.98, f"Fusing audio: 0/{total_segments} segments")
     combined = AudioSegment.empty()
+    pause_between_paragraphs = AudioSegment.silent(duration=800)
+    fusion_errors = []
     
     for i, audio_file in enumerate(audio_files):
         try:
             audio = AudioSegment.from_mp3(audio_file)
             combined += audio
-            
             if i < len(audio_files) - 1:
-                current_parts = Path(audio_file).stem.split('_')
-                next_file = audio_files[i + 1]
-                next_parts = Path(next_file).stem.split('_')
-                
-                if current_parts[1] != next_parts[1]:
-                    combined += long_pause
-                else:
-                    combined += short_pause
-                    
+                combined += pause_between_paragraphs
         except Exception as e:
-            update_job_status(job_id, "running", 0.99, f"Error loading {audio_file}: {e}")
+            fusion_errors.append(f"Error loading {Path(audio_file).name}: {e}")
             continue
+        
+        fusion_progress = 0.98 + (i + 1) / total_segments * 0.01
+        update_job_status(job_id, "running", fusion_progress, 
+                         f"Fusing audio: {i+1}/{total_segments} segments")
     
     audiobook_path = story_dir / f"{safe_title}_audiobook.mp3"
-    combined.export(str(audiobook_path), format="mp3")
     
     try:
-        shutil.rmtree(tts_dir)
-    except:
-        pass
+        combined.export(str(audiobook_path), format="mp3")
+    except Exception as e:
+        update_job_status(job_id, "error", 0, f"Failed to export audiobook: {e}")
+        return None
+    
+    # Cleanup
+    cleanup_success = False
+    for attempt in range(3):
+        try:
+            shutil.rmtree(tts_dir)
+            cleanup_success = True
+            break
+        except Exception:
+            time.sleep(1)
+    
+    if not cleanup_success:
+        try:
+            for f in tts_dir.glob("*"):
+                try:
+                    f.unlink()
+                except:
+                    pass
+            tts_dir.rmdir()
+        except:
+            pass
+    
+    total_errors = len(errors) + len(fusion_errors)
+    if total_errors > 0:
+        update_job_status(job_id, "running", 0.99, 
+                         f"Audiobook exported with {total_errors} errors (skipped bad segments)")
     
     return audiobook_path
+
+
 
 # --- Streamlit UI Pages ---
 
@@ -757,11 +999,27 @@ def main():
     st.title("📖 Story Generator")
     st.markdown("Generate stories with AI, complete with multi-voice TTS audiobook generation.")
 
-    # Check for active jobs and show banner
+    # Check for active jobs and show progress in sidebar
     jobs = get_all_jobs()
     running_jobs = [j for j in jobs if j['status'] == 'running']
+    
     if running_jobs:
-        st.sidebar.warning(f"⚙️ {len(running_jobs)} job(s) running in background")
+        st.sidebar.markdown("### ⚙️ Background Jobs")
+        for job in running_jobs:
+            job_id = job.get('job_id', 'unknown')
+            title = job.get('title', 'Working...')
+            job_type = job.get('job_type', 'story')
+            
+            with st.sidebar.container():
+                st.markdown(f"**{job_type.title()}:** {title}")
+                st.progress(job['progress'])
+                st.caption(job['message'][:80] + ('...' if len(job['message']) > 80 else ''))
+                st.caption(f"Job ID: `{job_id}`")
+                st.divider()
+        
+        # Auto-refresh while jobs are running
+        time.sleep(2)
+        st.rerun()
 
     menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story"]
     choice = st.sidebar.selectbox("Menu", menu)
@@ -923,6 +1181,14 @@ def job_status_page():
     if not jobs:
         st.info("No background jobs found.")
         return
+
+    col1, col2 = st.columns([4, 1])
+    with col2:
+        if st.button("🗑️ Clear All Finished"):
+            for job in jobs:
+                if job['status'] in ['completed', 'error']:
+                    delete_job(job['job_id'])
+            st.rerun()
     
     # Sort by timestamp (newest first)
     jobs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
