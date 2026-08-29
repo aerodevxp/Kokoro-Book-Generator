@@ -1731,6 +1731,12 @@ def main():
     elif choice == "Clean Existing Story":
         clean_existing_story_page()
 
+def randomize_features():
+    """Callback to randomly select 5 features"""
+    features = load_features()
+    num_to_select = min(5, len(features))
+    st.session_state['selected_features'] = random.sample(features, num_to_select)
+
 def generate_new_story_page():
     st.header("Generate New Story")
     
@@ -1865,7 +1871,13 @@ def generate_new_story_page():
                         st.write(f"• {char}: {voice}")
         
         features = load_features()
-        selected_features = st.multiselect("Required Features", features)
+        col_feat1, col_feat2 = st.columns([4, 1])
+        with col_feat1:
+            selected_features = st.multiselect("Required Features", features, key="selected_features")
+        with col_feat2:
+            st.write("")  # Spacer to align with multiselect
+            st.write("")  # Spacer
+            st.button("🎲 Random 5", on_click=randomize_features)
         
         length_opts = {
             "AI decides": "Decide the optimal chapter count yourself",
