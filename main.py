@@ -1665,12 +1665,49 @@ Final book summary (600 words max):"""
 
 # --- Streamlit UI Pages ---
 
+def check_auth():
+    """Simple password gate using session state"""
+    if 'authenticated' not in st.session_state:
+        st.session_state['authenticated'] = False
+    
+    if st.session_state['authenticated']:
+        return True
+    
+    # Login screen
+    st.markdown("## 🔐 Story Generator")
+    st.markdown("Please enter the password to access the app.")
+    
+    with st.form("login_form"):
+        password = st.text_input("Password", type="password", placeholder="Enter password...")
+        submitted = st.form_submit_button("Login", type="primary")
+        
+        if submitted:
+            expected_password = os.getenv("APP_PASSWORD", "")
+            if password == expected_password and expected_password:
+                st.session_state['authenticated'] = True
+                st.rerun()
+            else:
+                st.error("❌ Incorrect password")
+    
+    # Logout button in sidebar (only shows if authenticated, but we put it here for safety)
+    return False
+
 def main():
     st.set_page_config(page_title="Story Generator", page_icon="📖", layout="wide")
     ensure_directories()
 
+    # Auth check
+    if not check_auth():
+        return
+
     st.title("📖 Story Generator")
     st.markdown("Generate stories with AI, complete with multi-voice TTS audiobook generation.")
+
+    # Logout button in sidebar
+    with st.sidebar:
+        if st.button("🚪 Logout"):
+            st.session_state['authenticated'] = False
+            st.rerun()
 
     # Check for active jobs and show progress in sidebar
     jobs = get_all_jobs()
@@ -1688,7 +1725,6 @@ def main():
                 st.progress(job['progress'])
                 st.caption(job['message'][:80] + ('...' if len(job['message']) > 80 else ''))
                 
-                # Cancel button in sidebar
                 if st.button("❌ Cancel", key=f"cancel_sidebar_{job_id}"):
                     request_cancel(job_id)
                     st.warning("Cancelling...")
@@ -1701,13 +1737,10 @@ def main():
                     os.remove(status_file)
                     time.sleep(3)
                     st.rerun()
-                    time.sleep(1)
-                    st.rerun()
 
                 st.caption(f"Job ID: `{job_id}`")
                 st.divider()
         
-        # Auto-refresh while jobs are running
         time.sleep(2)
         st.rerun()
 
