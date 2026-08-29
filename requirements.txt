@@ -14,3 +14,4 @@ audioio
 audioop-lts
 streamlit
 requests
+mutagen
