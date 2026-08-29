@@ -487,7 +487,7 @@ def generate_chapter_summary(chapter_text, chapter_num, job_id=None):
     """Generate a short summary of a chapter after it's written"""
     clean_text = remove_voice_tags(chapter_text)
     
-    prompt = f"""Summarize this chapter in 150 words max. Include:
+    prompt = f"""Summarize this chapter in 350 words max. Include:
 - Key events that occurred
 - Character developments or revelations
 - Important dialogue or decisions
@@ -528,7 +528,7 @@ def get_all_stories():
     return story_files
 
 def generate_story_summary(story_path, job_id=None):
-    """Generate a max 600-word summary — uses chapter summaries if available, otherwise chunks the full text"""
+    """Generate a max 1000-word summary — uses chapter summaries if available, otherwise chunks the full text"""
     
     # Check for existing chapter summaries first
     chapter_summaries_path = story_path.parent / f"{story_path.stem}_chapter_summaries.json"
@@ -1069,6 +1069,24 @@ def request_cancel(job_id):
             pass
 # --- Background Workers ---
 
+def stream_llm_with_retry(prompt, model, max_tokens, temperature, max_retries=3):
+    """Stream LLM response with retry logic for connection drops"""
+    for attempt in range(max_retries):
+        try:
+            response = llm_client.chat.completions.create(
+                model=model, 
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens, 
+                temperature=temperature, 
+                stream=True
+            )
+            return response
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"[WARN] LLM Connection error on attempt {attempt+1}, retrying in 5 seconds... ({e})")
+                time.sleep(5)
+            else:
+                raise e  # Re-raise the exception if all retries fail
 
 def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False):
     """Background worker for story generation"""
@@ -1175,6 +1193,7 @@ List each chapter with a brief description."""
                 chapter_progress = 0.1 + (chapter_num - 1) / total_chapters * 0.7
                 update_job_status(job_id, "running", chapter_progress, f"Phase 2: Writing Chapter {chapter_num}/{total_chapters}...")
 
+                # Build running summary of previous chapters
                 running_summary = build_running_summary(chapter_summaries)
                 
                 if chapter_num == 1:
@@ -1184,17 +1203,21 @@ Based on this outline:
 {outline}
 Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above."""
                 else:
-                    prev_content = ' '.join(story_parts[-1:])
+                    # NEW: Use running_summary instead of full previous chapter to save context window
                     ch_prompt = f"""{base_prompt}
 {worldbook_context}{story_context}{voice_instruction}
-Continue the story from:
-{prev_content}
+{running_summary}
+Continue the story logically from the summaries above. 
 Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above."""
                 ch_prompt += " End this chapter with [END]"
                 
-                response = llm_client.chat.completions.create(
-                    model=STORY_MODEL, messages=[{"role": "user", "content": ch_prompt}],
-                    max_tokens=2048, temperature=0.8, stream=True
+                # NEW: Use the retry wrapper
+                update_job_status(job_id, "running", chapter_progress, f"Phase 2: Requesting Chapter {chapter_num}/{total_chapters} from AI...")
+                response = stream_llm_with_retry(
+                    prompt=ch_prompt, 
+                    model=STORY_MODEL, 
+                    max_tokens=2048, 
+                    temperature=0.8
                 )
                 
                 chapter = ""
@@ -1625,7 +1648,7 @@ def generate_cover_image(title, story_summary, story_dir, job_id=None):
     return None
 
 def generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id=None):
-    """Generate a 600-word book summary from existing chapter summaries"""
+    """Generate an at most 1000-word book summary from existing chapter summaries"""
     if not chapter_summaries:
         return ""
     
