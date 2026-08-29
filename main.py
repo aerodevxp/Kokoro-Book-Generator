@@ -1235,7 +1235,25 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                     model=TITLE_MODEL, messages=[{"role": "user", "content": title_prompt}],
                     max_tokens=30, temperature=0.7
                 )
-                title = title_response.choices[0].message.content.strip().replace('\n', ' ')[:50]
+                title = title_response.choices[0].message.content.strip()
+                
+                # Remove common prefixes like "Title:", "**Title:**", "__Title:__", "Book Title:", etc.
+                title = re.sub(r'^[*_`#]*(?:Book\s+)?Title[*_`#]*\s*[:\-–]\s*', '', title, flags=re.IGNORECASE)
+                
+                # Remove markdown formatting characters (asterisks, backticks, hashes)
+                title = re.sub(r'[*`#]+', '', title)
+                
+                # Replace any remaining underscores with spaces
+                title = title.replace('_', ' ')
+                
+                # Remove surrounding quotes
+                title = title.strip('"\'""''')
+                
+                # Clean up whitespace and newlines
+                title = ' '.join(title.split())
+                
+                # Truncate to 50 chars
+                title = title[:50].strip()
             except:
                 title = "Untitled-Story"
             update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
