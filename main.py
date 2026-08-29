@@ -167,6 +167,7 @@ VOICE TAG INSTRUCTIONS:
 - Voice tags must come in pair, and have the SAME name!!! Example: <af_heart>Hi!</af_heart> - BAD EXAMPLE: <af_heart>No!!</af_nicole>
 - If continuing from a reference story, use the SAME voices for the SAME characters
 - The prefix for voice stand for their language and gender. Take that into account when picking a voice.
+- Your tags have to be within the same paragraph. You must open and close a tag within the same paragraph.
 
 Prefix Information:
 
