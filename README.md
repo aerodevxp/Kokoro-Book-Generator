@@ -1,6 +1,4 @@
-Here's a comprehensive README:
 
-```markdown
 # 📖 Book/Novel Generator
 
 Generate full-length novels with AI, complete with multi-voice TTS audiobooks, sound effects, cover art, and series management.
@@ -196,6 +194,3 @@ Create a `base_prompt.txt` file at the path specified in your `.env`. This is th
 ## 📜 License
 
 Personal use. Do whatever you want with it.
-```
-
-This covers everything we've built. Feel free to trim or adjust any sections!
