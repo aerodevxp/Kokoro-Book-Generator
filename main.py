@@ -2045,15 +2045,69 @@ def job_status_page():
                         elif p.suffix == '.mp3':
                             with open(p, 'rb') as f:
                                 st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg', key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.png':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='image/png', key=f"dl_{job_id}_{p.name}")
                 
                 if st.button(f"Clear Job", key=f"clear_{job_id}"):
                     delete_job(job_id)
                     st.rerun()
             elif job['status'] == 'error':
                 st.error(f"❌ Error: {job['message']}")
-                if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
-                    delete_job(job_id)
-                    st.rerun()
+                
+                # NEW: Retry and Clear buttons side-by-side
+                col_retry, col_clear = st.columns(2)
+                
+                with col_retry:
+                    if st.button(f"🔄 Retry Job", key=f"retry_{job_id}"):
+                        # Start new job with old params
+                        new_job_id = str(int(time.time()))
+                        params = job.get('params', {})
+                        
+                        if job_type == 'story':
+                            ref_story = Path(params['reference_story']) if params.get('reference_story') else None
+                            wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
+                            
+                            thread = threading.Thread(
+                                target=run_generation_worker,
+                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
+                                      ref_story, params.get('series_name'), wb_path, params.get('features', []), 
+                                      params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_job_id'] = new_job_id
+                            
+                        elif job_type == 'tts':
+                            story_path = Path(params['story_path'])
+                            thread = threading.Thread(target=run_tts_worker, args=(new_job_id, story_path))
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_tts_job_id'] = new_job_id
+                            
+                        elif job_type == 'clean':
+                            story_path = Path(params['story_path'])
+                            thread = threading.Thread(target=run_clean_worker, args=(new_job_id, story_path))
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_clean_job_id'] = new_job_id
+                            
+                        elif job_type == 'summary':
+                            story_path = Path(params['story_path'])
+                            thread = threading.Thread(target=run_summary_worker, args=(new_job_id, story_path))
+                            thread.daemon = True
+                            thread.start()
+                            
+                        # Delete the old failed job
+                        delete_job(job_id)
+                        st.success(f"✅ Retrying job as {new_job_id}")
+                        time.sleep(2)
+                        st.rerun()
+                
+                with col_clear:
+                    if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
+                        delete_job(job_id)
+                        st.rerun()
 
 def generate_tts_existing_page():
     st.header("Generate TTS for Existing Story")
