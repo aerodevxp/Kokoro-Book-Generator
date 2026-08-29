@@ -189,7 +189,20 @@ im_ Italian – Male
 pf_ Brazilian Portuguese – Female
 pm_ Brazilian Portuguese – Male
 
+SOUND EFFECTS (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
+- Use [sfx:effect_name] to insert a sound effect that interrupts speech.
+- Use [bgsfx:effect_name] to start a background sound effect, and [/bgsfx] to stop it (the closing tag cannot contain the effect name. only one bg can be played at a time, so choose wisely).
+- Background sounds continue across multiple paragraphs/voice clips until stopped.
+- You can use ANY descriptive effect name. If it's not cached locally, it will be fetched automatically.
+- Use descriptive names: door_creak, glass_shatter, wolf_howl, sword_clash, rain_heavy, crowd_market
+- Place SFX tags INSIDE voice tags where the sound should occur.
+- Available effects already cached: {sfx_str}
 
+Example (Interrupting SFX):
+<af_heart>The door opened slowly. [sfx:door_creak] Sarah walked in.</af_heart>
+
+Example (Background SFX):
+[bgsfx:rain_heavy] <af_heart>The storm raged outside.</af_heart> <am_adam>We should go inside.</am_adam> [/bgsfx]
 
 VOICE MIXING:
 - You can mix voices using weighted ratios: <af_bella(2)+af_heart(1)>mixed voice dialogue</af_bella(2)+af_heart(1)>
@@ -232,23 +245,8 @@ Example (voice mixing for a unique character):
 Example (pronunciation correction):
 <am_michael>He lived in [Worcester](/wˈʊstər/) for years.</am_michael>
 """
-
-    instruction += f"""
-SOUND EFFECTS:
-- Use [sfx:effect_name] to insert a sound effect that interrupts speech.
-- Use [bgsfx:effect_name] to start a background sound effect, and [/bgsfx] to stop it (the closing tag cannot contain the effect name. only one bg can be played at a time, so choose wisely).
-- Background sounds continue across multiple paragraphs/voice clips until stopped.
-- You can use ANY descriptive effect name. If it's not cached locally, it will be fetched automatically.
-- Use descriptive names: door_creak, glass_shatter, wolf_howl, sword_clash, rain_heavy, crowd_market
-- Place SFX tags INSIDE voice tags where the sound should occur.
-
-Example (Interrupting SFX):
-<af_heart>The door opened slowly. [sfx:door_creak] Sarah walked in.</af_heart>
-
-Example (Background SFX):
-[bgsfx:rain_heavy] <af_heart>The storm raged outside.</af_heart> <am_adam>We should go inside.</am_adam> [/bgsfx]
-"""
     return instruction
+
 
 def extract_voices_used(story):
     voices = set()
