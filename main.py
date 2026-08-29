@@ -120,23 +120,7 @@ def ensure_directories():
     for directory in dirs:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
-def string_to_pdf(string, outputFullPath):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=72)
-    pdf.set_font("Helvetica", size=12)
-    pdf.set_text_color(34, 34, 34)
-    
-    paragraphs = [p.strip() for p in string.split('\n\n') if p.strip()]
-    if not paragraphs:
-        paragraphs = [string]
-    
-    for i, para in enumerate(paragraphs):
-        pdf.multi_cell(0, 10, para)
-        if i < len(paragraphs) - 1:
-            pdf.ln(6)
-    
-    pdf.output(outputFullPath)
+
 
 def clean_text_for_tts(text):
     text = text.replace('"', '').replace('"', '').replace('"', '')
@@ -237,6 +221,54 @@ def load_features():
         features = default_features
     return features
 
+def string_to_pdf(string, outputFullPath):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=72)
+    
+    # Point to the assets folder
+    pdf.add_font("DejaVu", "", "./assets/DejaVuSans.ttf", uni=True)
+    pdf.set_font("DejaVu", size=12)
+    pdf.set_text_color(34, 34, 34)
+    
+    #paragraphs = [p.strip() for p in string.split('\n\n') if p.strip()]
+    paragraphs = []
+    for p in kokoro_text.split('\n\n'):
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) < 5:
+            continue
+        if re.match(r'^-+\.?\s*$', p):
+            continue
+        
+        # Remove Markdown formatting that TTS can't pronounce
+        p = re.sub(r'^#{1,6}\s+', '', p)  # Remove # headers at start of line
+        p = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', p)  # Remove *bold/italic* markers
+        #p = re.sub(r'_{1,3}([^_]+)_{1,3}', r'\1', p)  # Remove _bold/italic_ markers
+        #p = re.sub(r'^\s*[-*+]\s+', '', p)  # Remove unordered list markers (- * +)
+        #p = re.sub(r'^\s*\d+\.\s+', '', p)  # Remove ordered list markers (1. 2. etc.)
+        
+        # Check actual spoken text length (after removing voice tags and control tokens)
+        spoken_text = re.sub(r'$$voice:[^$$]+$$', '', p)
+        spoken_text = PAUSE_PATTERN.sub('', spoken_text)
+        spoken_text = RATE_PATTERN.sub('', spoken_text)
+        spoken_text = spoken_text.strip()
+        if len(spoken_text) < 3:
+            continue
+        paragraphs.append(p)
+
+
+    if not paragraphs:
+        paragraphs = [string]
+    
+    for i, para in enumerate(paragraphs):
+        pdf.multi_cell(0, 10, para)
+        if i < len(paragraphs) - 1:
+            pdf.ln(6)
+    
+    pdf.output(outputFullPath)
+ 
 def generate_chapter_summary(chapter_text, chapter_num, job_id=None):
     """Generate a short summary of a chapter after it's written"""
     clean_text = remove_voice_tags(chapter_text)
@@ -1086,7 +1118,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     #print(f"[DEBUG] {kokoro_text}")
 
     # Split into paragraphs for manageable chunks
-    paragraphs = [p.strip() for p in kokoro_text.split('\n\n') if p.strip()]
+    paragraphs = [
+        p.strip() for p in kokoro_text.split('\n\n') 
+        if p.strip() and len(p.strip()) > 5 and not re.match(r'^-+\.?\s*$', p.strip())
+    ]
     
     if not paragraphs:
         update_job_status(job_id, "error", 0, "No text content found for TTS")
@@ -1114,6 +1149,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         
         for attempt in range(max_retries):
             try:
+                print(f"[DEBUG] Paragraph {i}: {paragraph[:100]}...")
                 tts_response = requests.post(
                     f"{TTS_URL}/audio/speech",
                     json={
@@ -1135,18 +1171,25 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                             f.write(chunk)
                 else:
                     raise Exception(f"TTS API returned {tts_response.status_code}: {tts_response.text[:200]}")
-                
+                file_size = audio_file.stat().st_size
+                if file_size < 1000:
+                    with open(str(audio_file), 'r') as f: raise Exception(f"Tiny file ({file_size}b): {f.read()[:200]}")
                 if validate_mp3(str(audio_file)):
                     audio_files.append(str(audio_file))
                     success = True
                     break
                 else:
+                    print(tts_response)
                     if audio_file.exists():
                         try:
                             audio_file.unlink()
                         except:
                             pass
+                    err_msg = f"P{i} Attempt {attempt+1}: {str(e)[:150]}"
+                    print(f"[ERROR] {err_msg}")
                     
+                    # ADD THIS TO SEE THE TEXT THAT FAILED:
+                    print(f"[ERROR] FAILED TEXT: {paragraph[:200]}")
                     if attempt < max_retries - 1:
                         update_job_status(job_id, "running", progress, 
                                          f"TTS Generation: {i+1}/{total_paragraphs} - Retry {attempt+2}/{max_retries} (corrupt MP3)")
