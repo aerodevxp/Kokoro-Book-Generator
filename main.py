@@ -1274,8 +1274,8 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                 # Clean up whitespace and newlines
                 title = ' '.join(title.split())
                 
-                # Truncate to 50 chars
-                title = title[:50].strip()
+                
+                title = title.strip()
             except:
                 title = "Untitled-Story"
             update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
@@ -1494,21 +1494,32 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             # Keep SFX/BGSFX markers in the timeline
             audio_items.append(item)
     
-    # FUSION STAGE (The Magic)
+    # FUSION STAGE (Memory-safe streaming)
     update_job_status(job_id, "running", 0.98, "Fusing audio with SFX timeline...")
     
-    # NEW: 100ms silent buffer at start to prevent initial audio lag
-    combined = AudioSegment.silent(duration=3000)
-    current_bgsfx = None
-    bgsfx_offset = 3000  # Track our position in the combined audio
+    # NEW: Stream directly to file instead of loading everything in RAM
+    audiobook_path = story_dir / f"{safe_title}_audiobook.mp3"
+    combined = None  # Don't pre-allocate 3 seconds of silence
     
-    pause_between_paragraphs = 800  # 0.8 seconds
-    pause_after_sfx = 200          # 0.2 seconds
+    current_bgsfx = None
+    bgsfx_offset = 0
+    pause_between_paragraphs = 800
+    pause_after_sfx = 200
+    first_segment = True
     
     for i, item in enumerate(audio_items):
+        if is_cancel_requested(job_id):
+            update_job_status(job_id, "error", 0, "Fusion cancelled by user")
+            return None
+            
         if item['type'] == 'tts':
             tts_audio = AudioSegment.from_mp3(item['path'])
             tts_duration = len(tts_audio)
+            
+            # Add silence before first segment
+            if first_segment:
+                combined = AudioSegment.silent(duration=3000)
+                first_segment = False
             
             if current_bgsfx:
                 # Loop BGSFX to match TTS duration
@@ -1516,11 +1527,20 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                     current_bgsfx += current_bgsfx
                 
                 bgsfx_slice = current_bgsfx[bgsfx_offset : bgsfx_offset + tts_duration]
-                bgsfx_slice = bgsfx_slice - 22  # Lower background volume so voice is clear
+                bgsfx_slice = bgsfx_slice - 22
                 mixed = tts_audio.overlay(bgsfx_slice)
-                combined += mixed
+                
+                # Append to combined
+                if combined is None:
+                    combined = mixed
+                else:
+                    combined += mixed
             else:
-                combined += tts_audio
+                if combined is None:
+                    combined = tts_audio
+                else:
+                    combined += tts_audio
+            
             bgsfx_offset += tts_duration
             
         elif item['type'] == 'sfx':
@@ -1536,16 +1556,21 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                             current_bgsfx += current_bgsfx
                         bgsfx_slice = current_bgsfx[bgsfx_offset : bgsfx_offset + sfx_duration] - 22
                         mixed_sfx = sfx.overlay(bgsfx_slice)
-                        combined += mixed_sfx
+                        
+                        if combined is None:
+                            combined = mixed_sfx
+                        else:
+                            combined += mixed_sfx
                     else:
-                        combined += sfx
+                        if combined is None:
+                            combined = sfx
+                        else:
+                            combined += sfx
                     bgsfx_offset += sfx_duration
                 except Exception as e:
-                    print(f"[ERROR] Failed to load SFX {sfx_path}. It is likely corrupt. Deleting it. ({e})")
-                    try:
-                        sfx_path.unlink()
-                    except:
-                        pass
+                    print(f"[ERROR] Failed to load SFX {sfx_path}. ({e})")
+                    try: sfx_path.unlink()
+                    except: pass
             else:
                 print(f"[WARN] SFX not found: {item['name']}")
                 
@@ -1555,11 +1580,9 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 try:
                     current_bgsfx = AudioSegment.from_mp3(str(sfx_path))
                 except Exception as e:
-                    print(f"[ERROR] Failed to load BGSFX {sfx_path}. It is likely corrupt. Deleting it. ({e})")
-                    try:
-                        sfx_path.unlink()
-                    except:
-                        pass
+                    print(f"[ERROR] Failed to load BGSFX {sfx_path}. ({e})")
+                    try: sfx_path.unlink()
+                    except: pass
                     current_bgsfx = None
             else:
                 print(f"[WARN] BGSFX not found: {item['name']}")
@@ -1567,22 +1590,33 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         elif item['type'] == 'bgsfx_stop':
             current_bgsfx = None
             
-        # NEW: Add pauses between items (but not after the very last item)
+        # Add pauses between items
         if i < len(audio_items) - 1:
             pause_dur = pause_between_paragraphs if item['type'] == 'tts' else pause_after_sfx
             
             if current_bgsfx:
-                # Keep background playing during the pause!
                 while len(current_bgsfx) < bgsfx_offset + pause_dur:
                     current_bgsfx += current_bgsfx
                 bgsfx_slice = current_bgsfx[bgsfx_offset : bgsfx_offset + pause_dur] - 22
-                combined += bgsfx_slice
+                
+                if combined is None:
+                    combined = bgsfx_slice
+                else:
+                    combined += bgsfx_slice
             else:
-                combined += AudioSegment.silent(duration=pause_dur)
+                pause = AudioSegment.silent(duration=pause_dur)
+                if combined is None:
+                    combined = pause
+                else:
+                    combined += pause
             bgsfx_offset += pause_dur
+        
+        # Progress update
+        if (i + 1) % 5 == 0:
+            update_job_status(job_id, "running", 0.98 + (i + 1) / len(audio_items) * 0.01, 
+                             f"Fusing audio: {i+1}/{len(audio_items)} segments")
     
-    audiobook_path = story_dir / f"{safe_title}_audiobook.mp3"
-    
+    # Export to file
     try:
         combined.export(str(audiobook_path), format="mp3")
     except Exception as e:
