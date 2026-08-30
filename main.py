@@ -772,7 +772,8 @@ def fix_sfx_tags(text):
         name = name.replace(' ', '_')
         return f"[{tag_type}:{name}]"
     
-    text = re.sub(r'\x5B(sfx|bgsfx):\s*([a-zA-Z0-9_ ]+)\s*\x5D', clean_sfx, text, flags=re.IGNORECASE)
+    # FIXED: Match ANY characters except ] so we can catch and clean punctuation
+    text = re.sub(r'\x5B(sfx|bgsfx):\s*([^\x5D]+)\x5D', clean_sfx, text, flags=re.IGNORECASE)
 
     
     # Auto-close unclosed bgsfx tags
@@ -1453,6 +1454,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     
     # FUSION STAGE (Hybrid Memory-Safe Approach)
     update_job_status(job_id, "running", 0.98, "Fusing audio with SFX timeline...")
+    print("[INFO] Starting audio fusion stage...")
     
     audiobook_path = story_dir / f"{safe_title}_audiobook.mp3"
     temp_dir = story_dir / "temp_chunks"
@@ -1461,7 +1463,8 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     pause_tts = AudioSegment.silent(duration=800)
     pause_sfx = AudioSegment.silent(duration=200)
     
-    chunk_size = 100
+    # NEW: Reduced chunk size to 20 for more frequent UI updates
+    chunk_size = 20
     chunk_files = []
     chunk_num = 0
     
@@ -1482,7 +1485,6 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 tts_duration = len(tts_audio)
                 
                 if current_bgsfx:
-                    # MEMORY SAFE LOOP: Slice the original BGSFX using modulo math
                     bgsfx_len = len(current_bgsfx)
                     needed_duration = tts_duration
                     start_ms = bgsfx_offset % bgsfx_len
@@ -1493,9 +1495,9 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                         take = min(bgsfx_len - start_ms, needed_duration - current_pos)
                         bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
                         current_pos += take
-                        start_ms = 0 # Next loop starts from beginning
+                        start_ms = 0
                         
-                    bgsfx_slice = bgsfx_slice - 22
+                    bgsfx_slice = bgsfx_slice - 28
                     mixed = tts_audio.overlay(bgsfx_slice)
                     chunk_audio += mixed
                 else:
@@ -1510,7 +1512,6 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                         sfx_duration = len(sfx)
                         
                         if current_bgsfx:
-                            # MEMORY SAFE LOOP
                             bgsfx_len = len(current_bgsfx)
                             needed_duration = sfx_duration
                             start_ms = bgsfx_offset % bgsfx_len
@@ -1523,7 +1524,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                                 current_pos += take
                                 start_ms = 0
                                 
-                            bgsfx_slice = bgsfx_slice - 22
+                            bgsfx_slice = bgsfx_slice - 28
                             mixed_sfx = sfx.overlay(bgsfx_slice)
                             chunk_audio += mixed_sfx
                         else:
@@ -1539,6 +1540,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 if sfx_path and sfx_path.exists():
                     try:
                         current_bgsfx = AudioSegment.from_mp3(str(sfx_path))
+                        print(f"[INFO] BGSFX started: {item['name']}")
                     except Exception as e:
                         print(f"[ERROR] BGSFX load failed: {e}")
                         current_bgsfx = None
@@ -1547,12 +1549,12 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                     
             elif item['type'] == 'bgsfx_stop':
                 current_bgsfx = None
+                print(f"[INFO] BGSFX stopped")
                 
             if j < len(chunk_items) - 1:
                 pause_dur = pause_tts if item['type'] == 'tts' else pause_sfx
                 
                 if current_bgsfx:
-                    # MEMORY SAFE LOOP FOR PAUSES
                     bgsfx_len = len(current_bgsfx)
                     needed_duration = len(pause_dur)
                     start_ms = bgsfx_offset % bgsfx_len
@@ -1565,14 +1567,15 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                         current_pos += take
                         start_ms = 0
                         
-                    bgsfx_slice = bgsfx_slice - 22
+                    bgsfx_slice = bgsfx_slice - 28
                     chunk_audio += bgsfx_slice
                 else:
                     chunk_audio += pause_dur
                 bgsfx_offset += len(pause_dur)
         
-        chunk_path = temp_dir / f"chunk_{chunk_num:04d}.mp3"
-        chunk_audio.export(str(chunk_path), format="mp3")
+        # NEW: Export as WAV (10x faster than MP3, FFmpeg will encode to MP3 at the end)
+        chunk_path = temp_dir / f"chunk_{chunk_num:04d}.wav"
+        chunk_audio.export(str(chunk_path), format="wav")
         chunk_files.append(chunk_path)
         chunk_num += 1
         
@@ -1582,8 +1585,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         progress = 0.98 + (i + chunk_size) / len(audio_items) * 0.01
         update_job_status(job_id, "running", progress, 
                          f"Fusing audio: chunk {chunk_num} ({i+chunk_size}/{len(audio_items)} segments)")
+        print(f"[INFO] Fused chunk {chunk_num} ({i+chunk_size}/{len(audio_items)} segments)")
         
     update_job_status(job_id, "running", 0.99, "Finalizing audiobook with FFmpeg...")
+    print("[INFO] Finalizing audiobook with FFmpeg...")
     
     list_file = story_dir / "ffmpeg_list.txt"
     with open(list_file, 'w') as f:
@@ -1630,6 +1635,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         update_job_status(job_id, "running", 0.99, 
                          f"Audiobook exported with {total_errors} errors (skipped bad segments)")
     
+    print("[INFO] Audiobook generation complete!")
     return audiobook_path
 
 def generate_cover_image(title, story_summary, story_dir, job_id=None):
