@@ -10,6 +10,7 @@ import shutil
 import threading
 import subprocess
 import gc
+import difflib
 from fpdf import FPDF
 from mutagen.id3 import ID3, APIC, TIT2, TPE1
 from dotenv import load_dotenv
@@ -17,8 +18,9 @@ from pydub import AudioSegment
 from pydub.effects import strip_silence
 
 import requests
+import logging
+from logging.handlers import RotatingFileHandler
 
-# Load environment variables
 load_dotenv()
 
 # Configuration
@@ -39,6 +41,45 @@ SERIES_DIR = os.getenv("SERIES_DIR", os.path.join(OUTPUT_DIR, "series"))
 FEATURES_FILE = os.getenv("FEATURES_FILE", os.path.join(OUTPUT_DIR, "features.txt"))
 JOBS_DIR = os.getenv("JOBS_DIR", os.path.join(OUTPUT_DIR, "jobs"))
 SFX_DIR = os.getenv("SFX_DIR", os.path.join(OUTPUT_DIR, "sfx"))
+
+# --- LOGGING SETUP ---
+def setup_logger():
+    """Set up file logging for background threads"""
+    log_file = os.path.join(OUTPUT_DIR, "generator.log")
+    
+    # Create logger
+    logger = logging.getLogger("book_generator")
+    logger.setLevel(logging.DEBUG)
+    
+    # Prevent duplicate handlers if called multiple times
+    if logger.handlers:
+        return logger
+    
+    # File handler (rotates at 5MB, keeps 3 backups)
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=5*1024*1024, backupCount=3
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
+    ))
+    
+    # Console handler (only warnings and errors to stdout)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter(
+        '%(levelname)s: %(message)s'
+    ))
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+log = setup_logger()
+# Load environment variables
+
 
 VALID_VOICES = {
     "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore",
@@ -308,13 +349,32 @@ def get_sfx_path(sfx_name):
     custom_path = custom_dir / f"{sfx_name}.mp3"
     
     if custom_path.exists():
-        return custom_path
-        
+        if validate_mp3(str(custom_path)):
+            return custom_path
+        else:
+            log.warning(f"[WARN] Custom SFX '{sfx_name}' corrupt, deleting...")
+            try: custom_path.unlink()
+            except: pass
+    
     base_path = sfx_dir / f"{sfx_name}.mp3"
     variants = []
     if base_path.exists():
-        variants.append(base_path)
-    variants.extend(sfx_dir.glob(f"{sfx_name}_*.mp3"))
+        if validate_mp3(str(base_path)):
+            variants.append(base_path)
+        else:
+            log.warning(f"[WARN] SFX '{sfx_name}' base file corrupt, deleting...")
+            try: base_path.unlink()
+            except: pass
+    
+    for variant_path in sfx_dir.glob(f"{sfx_name}_*.mp3"):
+        if "_temp" in variant_path.name:
+            continue
+        if validate_mp3(str(variant_path)):
+            variants.append(variant_path)
+        else:
+            log.warning(f"[WARN] SFX variant '{variant_path.name}' corrupt, deleting...")
+            try: variant_path.unlink()
+            except: pass
     
     fetch_new = False
     if FREESOUND_API_KEY:
@@ -331,7 +391,7 @@ def get_sfx_path(sfx_name):
     if variants:
         return random.choice(variants)
     
-    print(f"[WARN] SFX '{sfx_name}' not found in custom or fetched folders, and could not be fetched")
+    log.warning(f"[WARN] SFX '{sfx_name}' not found or all variants corrupt")
     return None
 
 def fetch_new_sfx_variant(sfx_name, existing_variants):
@@ -340,7 +400,7 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
     downloaded_ids = set(cache.get(sfx_name, []))
     
     try:
-        print(f"[INFO] Fetching new SFX variant for '{sfx_name}' from Freesound...")
+        log.warning(f"[INFO] Fetching new SFX variant for '{sfx_name}' from Freesound...")
         search_response = requests.get(
             "https://freesound.org/apiv2/search/text/",
             params={
@@ -355,12 +415,12 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
         )
         
         if search_response.status_code != 200:
-            print(f"[WARN] Freesound search failed: {search_response.status_code}")
+            log.warning(f"[WARN] Freesound search failed: {search_response.status_code}")
             return None
         
         results = search_response.json().get("results", [])
         if not results:
-            print(f"[WARN] No Freesound results for '{sfx_name}'")
+            log.warning(f"[WARN] No Freesound results for '{sfx_name}'")
             return None
         
         candidates = []
@@ -373,7 +433,7 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
                 candidates.append(result)
         
         if not candidates:
-            print(f"[INFO] All Freesound results for '{sfx_name}' already downloaded")
+            log.warning(f"[INFO] All Freesound results for '{sfx_name}' already downloaded")
             return None
         
         pick = random.choice(candidates[:3])
@@ -382,12 +442,12 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
             preview_url = pick["previews"].get("preview-lq-mp3")
         
         if not preview_url:
-            print(f"[WARN] No preview URL for Freesound result")
+            log.warning(f"[WARN] No preview URL for Freesound result")
             return None
         
         audio_response = requests.get(preview_url, timeout=90)
         if audio_response.status_code != 200:
-            print(f"[WARN] Freesound download failed: {audio_response.status_code}")
+            log.warning(f"[WARN] Freesound download failed: {audio_response.status_code}")
             return None
         
         variant_num = len(existing_variants) + 1
@@ -401,7 +461,7 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
             f.write(audio_response.content)
         
         if not validate_mp3(str(temp_path)):
-            print(f"[WARN] Downloaded SFX for '{sfx_name}' was corrupt or invalid. Discarding.")
+            log.warning(f"[WARN] Downloaded SFX for '{sfx_name}' was corrupt or invalid. Discarding.")
             temp_path.unlink()
             return None
         
@@ -415,16 +475,23 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
         audio.export(str(variant_path), format="mp3")
         temp_path.unlink()
         
+        # VALIDATE BEFORE CACHING
+        if not validate_mp3(str(variant_path)):
+            log.warning(f"[WARN] Downloaded SFX for '{sfx_name}' failed validation after export. Discarding.")
+            try: variant_path.unlink()
+            except: pass
+            return None
+        
         if sfx_name not in cache:
             cache[sfx_name] = []
         cache[sfx_name].append(pick["id"])
         save_sfx_cache(cache)
         
-        print(f"[INFO] Cached new SFX variant: {variant_path} (Freesound ID: {pick['id']})")
+        log.warning(f"[INFO] Cached new SFX variant: {variant_path} (Freesound ID: {pick['id']})")
         return variant_path
         
     except Exception as e:
-        print(f"[ERROR] Freesound fetch failed for '{sfx_name}': {e}")
+        log.warning(f"[ERROR] Freesound fetch failed for '{sfx_name}': {e}")
         temp_path = sfx_dir / f"{sfx_name}_temp.mp3"
         if temp_path.exists():
             try: temp_path.unlink()
@@ -621,12 +688,12 @@ def load_story_context(story_path, job_id=None):
             with open(summary_path, 'r') as f:
                 summary = f.read()
         else:
-            print(f"[INFO] No summary found for '{story_path.stem}', generating one...")
+            log.warning(f"[INFO] No summary found for '{story_path.stem}', generating one...")
             summary = generate_story_summary(story_path, job_id)
         
         return f"Reference Story Summary (from '{story_path.stem}'):\n{summary}\n\n"
     except Exception as e:
-        print(f"Error loading/generating story summary: {e}")
+        log.warning(f"Error loading/generating story summary: {e}")
         return ""
 
 def get_worldbooks():
@@ -759,6 +826,78 @@ def preprocess_sfx_in_voice_tags(text):
         if new_text == text:
             break
         text = new_text
+    return text
+
+def correct_voice_typo(voice):
+    """Attempts to correct a hallucinated voice name to the closest valid voice."""
+    voice_lower = voice.lower()
+    
+    # If it's already valid, leave it alone
+    if voice_lower in VALID_VOICES:
+        return voice_lower
+    
+    # Don't try to correct mixed voices (they are complex strings)
+    if '+' in voice_lower:
+        return voice_lower
+    
+    # Find the closest match in our valid voices list (cutoff 0.8 = 80% similar)
+    matches = difflib.get_close_matches(voice_lower, VALID_VOICES, n=1, cutoff=0.8)
+    if matches:
+        return matches[0]
+    
+    # If no close match found, return the original (it will get removed as orphaned later)
+    return voice_lower
+
+def fix_voice_tags(text):
+    """Fixes typos, mismatched voice tags, and removes orphaned tags."""
+    voice_regex = r'(?:am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)_[a-z0-9_+(]+'
+    
+    # 1. Fix typos in all voice tags (e.g., <af_echo> -> <am_echo>)
+    tag_pattern = re.compile(rf'(</?)({voice_regex})>', re.IGNORECASE)
+    def correct_tag(match):
+        is_closing = match.group(1) == '</'
+        voice = match.group(2)
+        corrected = correct_voice_typo(voice)
+        return f"</{corrected}>" if is_closing else f"<{corrected}>"
+    
+    text = tag_pattern.sub(correct_tag, text)
+    
+    # 2. Fix mismatched pairs: <open>content</close> -> <open>content</open>
+    pair_pattern = re.compile(rf'<({voice_regex})>([^<]*?)</({voice_regex})>', re.DOTALL | re.IGNORECASE)
+    
+    def fix_pair(match):
+        open_tag = match.group(1)
+        content = match.group(2)
+        close_tag = match.group(3)
+        if open_tag.lower() != close_tag.lower():
+            return f"<{open_tag}>{content}</{open_tag}>"
+        return match.group(0)
+    
+    for _ in range(3):
+        new_text = pair_pattern.sub(fix_pair, text)
+        if new_text == text:
+            break
+        text = new_text
+        
+    # 3. Protect valid pairs with placeholders
+    placeholder_map = {}
+    def replace_pair(match):
+        placeholder = f"__VOICE_PAIR_{len(placeholder_map)}__"
+        placeholder_map[placeholder] = match.group(0)
+        return placeholder
+    
+    text = pair_pattern.sub(replace_pair, text)
+    
+    # 4. Remove orphaned closing tags
+    text = re.sub(rf'</{voice_regex}>', '', text, flags=re.IGNORECASE)
+    
+    # 5. Remove orphaned opening tags
+    text = re.sub(rf'<{voice_regex}>', '', text, flags=re.IGNORECASE)
+    
+    # 6. Restore valid pairs
+    for placeholder, original in placeholder_map.items():
+        text = text.replace(placeholder, original)
+    
     return text
 
 def fix_sfx_tags(text):
@@ -1062,6 +1201,53 @@ def request_cancel(job_id):
         except:
             pass
 
+def delete_story_completely(story_path):
+    """Delete a story folder and remove all references from series/worldbook JSONs"""
+    story_path = Path(story_path)
+    story_folder = story_path.parent
+    story_title = story_folder.name
+    deleted_files = []
+    
+    # Check if it's in a series and remove from series.json
+    try:
+        rel_path = story_folder.relative_to(Path(SERIES_DIR))
+        series_name = rel_path.parts[0]
+        
+        meta = load_series_metadata(series_name)
+        if meta:
+            # Remove the story from the series
+            meta["stories"] = [s for s in meta["stories"] if s["title"] != story_title]
+            
+            # Reorder remaining stories
+            for i, story in enumerate(meta["stories"]):
+                story["order"] = i + 1
+            
+            save_series_metadata(series_name, meta)
+            
+            # If series is now empty, optionally delete it
+            if not meta["stories"]:
+                # Remove worldbook link to this series
+                if meta.get("worldbook"):
+                    wb_path = Path(WORLDBOOK_DIR) / meta["worldbook"]
+                    if wb_path.exists():
+                        wb_meta = get_worldbook_metadata(wb_path)
+                        if series_name in wb_meta["linked_series"]:
+                            wb_meta["linked_series"].remove(series_name)
+                            save_worldbook_metadata(wb_path, wb_meta)
+    except ValueError:
+        # Not in a series, it's standalone
+        pass
+    
+    # Delete the entire story folder
+    try:
+        if story_folder.exists():
+            for f in story_folder.iterdir():
+                deleted_files.append(str(f))
+            shutil.rmtree(story_folder)
+            return True, f"Deleted '{story_title}' and {len(deleted_files)} files"
+    except Exception as e:
+        return False, f"Error deleting story: {e}"
+
 def stream_llm_with_retry(prompt, model, max_tokens, temperature, max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -1075,12 +1261,12 @@ def stream_llm_with_retry(prompt, model, max_tokens, temperature, max_retries=3)
             return response
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"[WARN] LLM Connection error on attempt {attempt+1}, retrying in 5 seconds... ({e})")
+                log.warning(f"[WARN] LLM Connection error on attempt {attempt+1}, retrying in 5 seconds... ({e})")
                 time.sleep(5)
             else:
                 raise e
 
-def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False):
+def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False, custom_title=""):
     cleanup_old_jobs(keep_last=3)
     try:
         def check_cancel():
@@ -1108,7 +1294,8 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             "reference_story": str(reference_story) if reference_story else None,
             "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
             "features": features, "length_instruction": length_instruction,
-            "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test
+            "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
+            "custom_title": custom_title
         }
         update_job_status(job_id, "running", 0, "Starting generation...", job_type="story", params=params)
         base_prompt = read_base_prompt()
@@ -1232,29 +1419,37 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
             
             story = "\n\n".join(story_parts)
 
+            story = fix_voice_tags(story)
+
             if not story.strip():
                 update_job_status(job_id, "error", 0, "Failed to generate story - empty response from AI")
                 return
             
             update_job_status(job_id, "running", 0.85, "Phase 3: Generating Title...")
             if check_cancel(): return
-            try:
-                title_prompt = f"Based on the following story outline, create ONE compelling title:\n========\n{outline}\n========\nONLY OUTPUT THE TITLE, NOTHING ELSE!"
-                title_response = llm_client.chat.completions.create(
-                    model=TITLE_MODEL, messages=[{"role": "user", "content": title_prompt}],
-                    max_tokens=30, temperature=0.7
-                )
-                title = title_response.choices[0].message.content.strip()
-                
-                title = re.sub(r'^[*_`#]*(?:Book\s+)?Title[*_`#]*\s*[:\-–]\s*', '', title, flags=re.IGNORECASE)
-                title = re.sub(r'[*`#]+', '', title)
-                title = title.replace('_', ' ')
-                title = title.strip('"\'""''')
-                title = ' '.join(title.split())
-                title = title[:50].strip()
-            except:
-                title = "Untitled-Story"
-            update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
+             # NEW: Check for custom title first
+            if custom_title and custom_title.strip():
+                title = custom_title.strip()
+                update_job_status(job_id, "running", 0.9, f"Using custom title: {title}", title=title)
+            else:
+                try:
+                    title_prompt = f"Based on the following story outline, create ONE compelling title:\n========\n{outline}\n========\nONLY OUTPUT THE TITLE, NOTHING ELSE!"
+                    title_response = llm_client.chat.completions.create(
+                        model=TITLE_MODEL, messages=[{"role": "user", "content": title_prompt}],
+                        max_tokens=30, temperature=0.7
+                    )
+                    title = title_response.choices[0].message.content.strip()
+                    
+                    title = re.sub(r'^[*_`#]*(?:Book\s+)?Title[*_`#]*\s*[:\-–]\s*', '', title, flags=re.IGNORECASE)
+                    title = re.sub(r'[*`#]+', '', title)
+                    title = title.replace('_', ' ')
+                    title = title.strip('"\'""''')
+                    title = ' '.join(title.split())
+                    title = title[:50].strip()
+                except:
+                    title = "Untitled-Story"
+                update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
+
 
         update_job_status(job_id, "running", 0.9, "Saving files...", title=title)
         filepath, story_dir = save_story(story, title, series_name)
@@ -1304,9 +1499,11 @@ def run_tts_worker(job_id, story_path):
         if tts_path.exists():
             with open(tts_path, 'r') as f:
                 story_content = f.read()
+                story_content = fix_voice_tags(story_content)
         else:
             with open(story_path, 'r') as f:
                 story_content = f.read()
+                story_content = fix_voice_tags(story_content)
         
         audiobook_path = generate_tts_background(story_content, story_path.stem, story_path.parent, job_id)
         
@@ -1315,7 +1512,7 @@ def run_tts_worker(job_id, story_path):
         else:
             update_job_status(job_id, "error", 0, "TTS generation failed", job_type="tts")
     except Exception as e:
-        print(e)
+        log.warning(e)
         update_job_status(job_id, "error", 0, str(e), job_type="tts")
 
 def run_clean_worker(job_id, story_path):
@@ -1325,6 +1522,7 @@ def run_clean_worker(job_id, story_path):
         
         with open(story_path, 'r') as f:
             story_content = f.read()
+            story_content = fix_voice_tags(story_content)
         
         update_job_status(job_id, "running", 0.5, "Removing voice tags...", title=story_path.stem)
         clean_content = remove_voice_tags(story_content)
@@ -1335,17 +1533,51 @@ def run_clean_worker(job_id, story_path):
         
         update_job_status(job_id, "completed", 1.0, "Story cleaned successfully!", [str(clean_filepath)], story_path.stem, job_type="clean")
     except Exception as e:
-        print(e)
+        log.warning(e)
         update_job_status(job_id, "error", 0, str(e), job_type="clean")
 
+
 def validate_mp3(file_path):
+    """Full decode test using ffmpeg - for SFX files only"""
     try:
-        audio = AudioSegment.from_mp3(file_path)
-        if len(audio) > 0:
-            return True
-    except Exception:
-        pass
-    return False
+        result = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-i', str(file_path), '-f', 'null', '-'],
+            capture_output=True, timeout=30
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+def validate_tts_mp3(file_path):
+    """Fast validation for TTS segments - just check it loads"""
+    try:
+        audio = AudioSegment.from_file(file_path)  # auto-detects format
+        return len(audio) > 100  # At least 100ms
+    except:
+        return False
+
+def split_long_text(text, max_chars=300):
+    """Split text into smaller chunks that Kokoro can handle"""
+    if len(text) <= max_chars:
+        return [text]
+    
+    chunks = []
+    # Try to split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) <= max_chars:
+            current_chunk += sentence + " "
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+    
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    return chunks
 
 def generate_tts_background(story_text, title, story_dir, job_id):
     """Generate TTS using Kokoro's native multi-speaker support with SFX timeline fusion"""
@@ -1353,6 +1585,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     tts_dir = story_dir / f"{safe_title}_tts_segments"
     tts_dir.mkdir(parents=True, exist_ok=True)
 
+    story_text = fix_voice_tags(story_text)
     story_text = fix_sfx_tags(story_text)
     story_text = preprocess_sfx_in_voice_tags(story_text)
 
@@ -1384,7 +1617,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             paragraphs = [p.strip() for p in kokoro_text.split('\n\n') if p.strip()]
             for para in paragraphs:
                 if len(para) > 3:
-                    timeline.append({'type': 'tts', 'text': para})
+                    # Split long paragraphs into chunks Kokoro can handle
+                    for chunk in split_long_text(para, max_chars=300):
+                        if len(chunk) > 3:
+                            timeline.append({'type': 'tts', 'text': chunk})
     
     if not timeline:
         update_job_status(job_id, "error", 0, "No text content found for TTS")
@@ -1408,8 +1644,26 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             success = False
             progress = 0.9 + (processed_tts + 1) / tts_count * 0.08
             
+            # RESUME CHECK: If segment already exists and is valid, reuse it
+            if audio_file.exists():
+                if validate_tts_mp3(str(audio_file)):
+                    audio_items.append({'type': 'tts', 'path': str(audio_file)})
+                    processed_tts += 1
+                    msg = f"TTS Generation: {processed_tts}/{tts_count} segments (reused {processed_tts})"
+                    if errors: msg += f" [{len(errors)} errors]"
+                    update_job_status(job_id, "running", progress, msg)
+                    continue
+                else:
+                    # Corrupt file, delete it so we can regenerate
+                    log.warning(f"[WARN] Existing segment {processed_tts} is corrupt, regenerating...")
+                    try: audio_file.unlink()
+                    except: pass
+            
+
             for attempt in range(max_retries):
                 try:
+                    log.debug(f"Segment {processed_tts}/{tts_count}: requesting TTS (attempt {attempt+1}/{max_retries})")
+                    
                     tts_response = requests.post(
                         f"{TTS_URL}/audio/speech",
                         json={
@@ -1426,24 +1680,37 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                     )
 
                     if tts_response.status_code == 200:
+                        content_type = tts_response.headers.get('content-type', '')
+                        if 'audio' not in content_type:
+                            error_text = tts_response.text[:200]
+                            log.error(f"Segment {processed_tts}: Non-audio response: {error_text}")
+                            raise Exception(f"Non-audio response: {error_text}")
+                        
                         with open(str(audio_file), 'wb') as f:
                             for chunk in tts_response.iter_content(chunk_size=8192):
                                 f.write(chunk)
                     else:
+                        log.error(f"Segment {processed_tts}: API {tts_response.status_code}: {tts_response.text[:100]}")
                         raise Exception(f"API {tts_response.status_code}: {tts_response.text[:100]}")
                     
-                    if validate_mp3(str(audio_file)):
+                    
+                    if validate_tts_mp3(str(audio_file)):
                         audio_items.append({'type': 'tts', 'path': str(audio_file)})
                         success = True
+                        log.debug(f"Segment {processed_tts}/{tts_count}: valid ({audio_file.stat().st_size} bytes)")
                         break
                     else:
+                        log.warning(f"Segment {processed_tts}/{tts_count}: validation failed, file is {audio_file.stat().st_size if audio_file.exists() else 0} bytes")
                         if audio_file.exists(): audio_file.unlink()
                 except Exception as e:
+                    log.error(f"Segment {processed_tts}/{tts_count}: attempt {attempt+1} failed: {e}")
                     if audio_file.exists(): audio_file.unlink()
                     if attempt < max_retries - 1:
                         time.sleep(1)
                     else:
                         errors.append(f"Segment {processed_tts}: {e}")
+                        log.error(f"Segment {processed_tts}/{tts_count}: ALL RETRIES EXHAUSTED")
+
             
             processed_tts += 1
             msg = f"TTS Generation: {processed_tts}/{tts_count} segments"
@@ -1454,7 +1721,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     
     # FUSION STAGE (Hybrid Memory-Safe Approach)
     update_job_status(job_id, "running", 0.98, "Fusing audio with SFX timeline...")
-    print("[INFO] Starting audio fusion stage...")
+    log.warning("[INFO] Starting audio fusion stage...")
     
     audiobook_path = story_dir / f"{safe_title}_audiobook.mp3"
     temp_dir = story_dir / "temp_chunks"
@@ -1481,7 +1748,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 return None
                 
             if item['type'] == 'tts':
-                tts_audio = AudioSegment.from_mp3(item['path'])
+                tts_audio = AudioSegment.from_file(item['path'])
                 tts_duration = len(tts_audio)
                 
                 if current_bgsfx:
@@ -1531,25 +1798,25 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                             chunk_audio += sfx
                         bgsfx_offset += sfx_duration
                     except Exception as e:
-                        print(f"[ERROR] SFX load failed: {e}")
+                        log.warning(f"[ERROR] SFX load failed: {e}")
                 else:
-                    print(f"[WARN] SFX not found: {item['name']}")
+                    log.warning(f"[WARN] SFX not found: {item['name']}")
                     
             elif item['type'] == 'bgsfx_start':
                 sfx_path = get_sfx_path(item['name'])
                 if sfx_path and sfx_path.exists():
                     try:
                         current_bgsfx = AudioSegment.from_mp3(str(sfx_path))
-                        print(f"[INFO] BGSFX started: {item['name']}")
+                        log.warning(f"[INFO] BGSFX started: {item['name']}")
                     except Exception as e:
-                        print(f"[ERROR] BGSFX load failed: {e}")
+                        log.warning(f"[ERROR] BGSFX load failed: {e}")
                         current_bgsfx = None
                 else:
-                    print(f"[WARN] BGSFX not found: {item['name']}")
+                    log.warning(f"[WARN] BGSFX not found: {item['name']}")
                     
             elif item['type'] == 'bgsfx_stop':
                 current_bgsfx = None
-                print(f"[INFO] BGSFX stopped")
+                log.warning(f"[INFO] BGSFX stopped")
                 
             if j < len(chunk_items) - 1:
                 pause_dur = pause_tts if item['type'] == 'tts' else pause_sfx
@@ -1585,10 +1852,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         progress = 0.98 + (i + chunk_size) / len(audio_items) * 0.01
         update_job_status(job_id, "running", progress, 
                          f"Fusing audio: chunk {chunk_num} ({i+chunk_size}/{len(audio_items)} segments)")
-        print(f"[INFO] Fused chunk {chunk_num} ({i+chunk_size}/{len(audio_items)} segments)")
+        log.warning(f"[INFO] Fused chunk {chunk_num} ({i+chunk_size}/{len(audio_items)} segments)")
         
     update_job_status(job_id, "running", 0.99, "Finalizing audiobook with FFmpeg...")
-    print("[INFO] Finalizing audiobook with FFmpeg...")
+    log.warning("[INFO] Finalizing audiobook with FFmpeg...")
     
     list_file = story_dir / "ffmpeg_list.txt"
     with open(list_file, 'w') as f:
@@ -1603,7 +1870,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     ]
     
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        update_job_status(job_id, "error", 0, f"FFmpeg concat failed: {e.stderr[:300]}")
+        return None
     except Exception as e:
         update_job_status(job_id, "error", 0, f"Failed to export audiobook: {e}")
         return None
@@ -1635,7 +1905,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         update_job_status(job_id, "running", 0.99, 
                          f"Audiobook exported with {total_errors} errors (skipped bad segments)")
     
-    print("[INFO] Audiobook generation complete!")
+    log.warning("[INFO] Audiobook generation complete!")
     return audiobook_path
 
 def generate_cover_image(title, story_summary, story_dir, job_id=None):
@@ -1666,7 +1936,7 @@ def generate_cover_image(title, story_summary, story_dir, job_id=None):
                 f.write(image_data)
             return cover_path
     except Exception as e:
-        print(f"[ERROR] Cover generation failed: {e}")
+        log.warning(f"[ERROR] Cover generation failed: {e}")
     return None
 
 def generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id=None):
@@ -1775,10 +2045,9 @@ def main():
                 st.caption(f"Job ID: `{job_id}`")
                 st.divider()
         
-        time.sleep(2)
-        st.rerun()
+        # REMOVED: time.sleep(2) and st.rerun() from here
 
-    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story"]
+    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story", "TTS Tester"]
     choice = st.sidebar.selectbox("Menu", menu)
 
     if choice == "Generate New Story":
@@ -1797,6 +2066,13 @@ def main():
         feature_manager_page()
     elif choice == "Clean Existing Story":
         clean_existing_story_page()
+    elif choice == "TTS Tester":
+        tts_tester_page()
+
+    # MOVED HERE: Auto-refresh at the very end, after everything renders
+    if running_jobs:
+        time.sleep(2)
+        st.rerun()
 
 def randomize_features():
     features = load_features()
@@ -1877,6 +2153,7 @@ def generate_new_story_page():
     with col1:
         topic = st.text_input("Topic", placeholder="Leave blank for AI to decide")
         genre = st.text_input("Genre", placeholder="Leave blank for AI to decide")
+        custom_title = st.text_input("Custom Title (optional)", placeholder="Leave blank for AI to generate")
         story_type = st.selectbox("Story Type", ["standalone", "sequel", "prequel"])
         
         reference_story = None
@@ -1964,7 +2241,7 @@ def generate_new_story_page():
         
         thread = threading.Thread(
             target=run_generation_worker,
-            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode, quick_test)
+            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode, quick_test, custom_title)
         ) 
         thread.daemon = True
         thread.start()
@@ -2074,7 +2351,9 @@ def job_status_page():
                                 target=run_generation_worker,
                                 args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
                                       ref_story, params.get('series_name'), wb_path, params.get('features', []), 
-                                      params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False))
+                                      params.get('length_instruction'), params.get('want_tts', True), 
+                                      params.get('debug_mode', False), params.get('quick_test', False), 
+                                      params.get('custom_title', "")) # <--- Added custom_title here
                             )
                             thread.daemon = True
                             thread.start()
@@ -2174,7 +2453,7 @@ def run_summary_worker(job_id, story_path):
         summary_path = story_path.parent / f"{story_path.stem}_summary.txt"
         update_job_status(job_id, "completed", 1.0, "Summary generated successfully!", [str(summary_path)], story_path.stem, job_type="summary")
     except Exception as e:
-        print(e)
+        log.warning(e)
         update_job_status(job_id, "error", 0, str(e), job_type="summary")
 
 def story_library_page():
@@ -2196,6 +2475,27 @@ def story_library_page():
     st.text_area("Content", story_content, height=500)
 
     st.divider()
+    
+    # Delete section
+    st.subheader("🗑️ Delete Story")
+    st.warning("This will permanently delete the story folder, audiobook, PDF, cover art, and all associated files.")
+    
+    col_del1, col_del2 = st.columns([1, 3])
+    with col_del1:
+        confirm_delete = st.checkbox("I understand this cannot be undone", key="confirm_delete")
+    with col_del2:
+        st.write("")  # spacer
+        if st.button("🗑️ Delete This Story", type="primary", disabled=not confirm_delete):
+            success, message = delete_story_completely(selected_file)
+            if success:
+                st.success(message)
+                time.sleep(2)
+                st.rerun()
+            else:
+                st.error(message)
+    
+    st.divider()
+    
     summary_path = selected_file.parent / f"{selected_file.stem}_summary.txt"
     
     if summary_path.exists():
@@ -2246,10 +2546,32 @@ def series_manager_page():
                         
                         if series.get('stories'):
                             st.write("**Stories (in order):**")
-                            for story in sorted(series['stories'], key=lambda x: x["order"]):
-                                st.write(f"{story['order']}. {story['title']} ({story['type']})")
-                                if story.get('reference'):
-                                    st.write(f"   ↳ References: {story['reference']}")
+                            sorted_stories = sorted(series['stories'], key=lambda x: x["order"])
+                            for idx, story in enumerate(sorted_stories):
+                                story_col1, story_col2 = st.columns([4, 1])
+                                with story_col1:
+                                    type_icon = {"prequel": "⏮️", "sequel": "⏭️", "standalone": "📖"}.get(story['type'], "📖")
+                                    st.write(f"{story['order']}. {type_icon} {story['title']} ({story['type']})")
+                                    if story.get('reference'):
+                                        st.write(f"   ↳ References: {story['reference']}")
+                                with story_col2:
+                                    btn_col1, btn_col2 = st.columns(2)
+                                    with btn_col1:
+                                        if idx > 0:
+                                            if st.button("⬆️", key=f"up_{series['name']}_{story['title']}"):
+                                                # Swap with previous
+                                                prev = sorted_stories[idx - 1]
+                                                story['order'], prev['order'] = prev['order'], story['order']
+                                                save_series_metadata(series['name'], series)
+                                                st.rerun()
+                                    with btn_col2:
+                                        if idx < len(sorted_stories) - 1:
+                                            if st.button("⬇️", key=f"down_{series['name']}_{story['title']}"):
+                                                # Swap with next
+                                                nxt = sorted_stories[idx + 1]
+                                                story['order'], nxt['order'] = nxt['order'], story['order']
+                                                save_series_metadata(series['name'], series)
+                                                st.rerun()
                         else:
                             st.write("*No stories yet*")
                     
@@ -2385,11 +2707,21 @@ Narrator: af_heart""", language="text")
             return
         
         wb_opts = [wb.stem for wb in worldbooks]
+        
+        # NEW: Track the previously selected worldbook
+        if 'last_selected_wb' not in st.session_state:
+            st.session_state['last_selected_wb'] = None
+            
         selected_wb = st.selectbox("Select Worldbook", wb_opts, key="edit_wb_select")
         
         wb_path = next(wb for wb in worldbooks if wb.stem == selected_wb)
         with open(wb_path, 'r') as f:
             current_content = f.read()
+        
+        # NEW: If the selection changed, force the text area to load the new content
+        if st.session_state['last_selected_wb'] != selected_wb:
+            st.session_state['edit_wb_content'] = current_content
+            st.session_state['last_selected_wb'] = selected_wb
         
         wb_meta = get_worldbook_metadata(wb_path)
         if wb_meta["linked_series"]:
@@ -2403,7 +2735,7 @@ Narrator: af_heart""", language="text")
         else:
             st.warning("No [CHARACTER VOICES] section found. Add one to assign consistent voices to characters.")
         
-        edited_content = st.text_area("Edit Content", current_content, height=400, key="edit_wb_content")
+        edited_content = st.text_area("Edit Content", height=400, key="edit_wb_content")
         
         if st.button("Update Worldbook", type="primary", key="update_wb"):
             with open(wb_path, 'w') as f:
@@ -2425,6 +2757,311 @@ def feature_manager_page():
         with open(FEATURES_FILE, 'w') as f:
             f.write('\n'.join(new_features))
         st.success(f"Features saved! {len(new_features)} features available.")
+
+def tts_tester_page():
+    st.header("🎙️ TTS Tester")
+    st.markdown("Test voice tags, SFX, pauses, rate changes, and voice mixing without generating a full story.")
+    
+    # Default example text
+    example_text = """<af_heart>The wind howled through the trees. [pause:0.5s] Branches scraped against the window like skeletal fingers.</af_heart>
+
+<am_adam>"Did you hear that?" [pause:1s] He turned, his eyes wide in the darkness.</am_adam>
+
+<af_bella>"It's just the storm," [rate:0.9] she replied, but her voice trembled.</af_bella>
+
+<af_heart>A door slammed somewhere below. [sfx:door_slam] Then silence. [pause:2s] Complete, suffocating silence.</af_heart>
+
+<af_bella(2)+af_nova(1)>"Or maybe it's not," [rate:0.8] a voice whispered — not Bella's, not Nova's, but something in between.</af_bella(2)+af_nova(1)>"""
+    
+    # Text input
+    test_text = st.text_area("Enter text to test", value=example_text, height=300, key="tts_test_input")
+    
+    if not test_text.strip():
+        st.warning("Please enter some text to test.")
+        return
+    
+    # Show detected features
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        voices_found = extract_voices_used(test_text)
+        st.metric("Voices Detected", len(voices_found))
+        if voices_found:
+            with st.expander("View voices"):
+                for v in voices_found:
+                    st.write(f"• `{v}`")
+    
+    with col2:
+        sfx_matches = re.findall(r'\x5Bsfx:([a-z0-9_]+)\x5D', test_text, re.IGNORECASE)
+        bgsfx_matches = re.findall(r'\x5Bbgsfx:([a-z0-9_]+)\x5D', test_text, re.IGNORECASE)
+        total_sfx = len(sfx_matches) + len(bgsfx_matches)
+        st.metric("SFX Detected", total_sfx)
+        if total_sfx:
+            with st.expander("View SFX"):
+                for s in sfx_matches:
+                    sfx_path = get_sfx_path(s)
+                    status = "✅ Cached" if sfx_path and sfx_path.exists() else "❌ Not found"
+                    st.write(f"• `[sfx:{s}]` — {status}")
+                for s in bgsfx_matches:
+                    sfx_path = get_sfx_path(s)
+                    status = "✅ Cached" if sfx_path and sfx_path.exists() else "❌ Not found"
+                    st.write(f"• `[bgsfx:{s}]` — {status}")
+    
+    with col3:
+        pause_count = len(re.findall(r'\x5Bpause:\d+\.?\d*s\x5D', test_text, re.IGNORECASE))
+        rate_count = len(re.findall(r'\x5Brate:\d+\.?\d*\x5D', test_text, re.IGNORECASE))
+        st.metric("Control Tokens", pause_count + rate_count)
+        if pause_count + rate_count:
+            with st.expander("View tokens"):
+                for p in re.findall(r'\x5Bpause:\d+\.?\d*s\x5D', test_text, re.IGNORECASE):
+                    st.write(f"• `{p}`")
+                for r in re.findall(r'\x5Brate:\d+\.?\d*\x5D', test_text, re.IGNORECASE):
+                    st.write(f"• `{r}`")
+    
+    st.divider()
+    
+    # Generate button
+    if st.button("🎙️ Generate Test TTS", type="primary"):
+        # Create temp directory for test
+        test_dir = Path(OUTPUT_DIR) / "_tts_test"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        
+        status_ph = st.empty()
+        prog_bar = st.progress(0)
+        
+        try:
+            # Preprocess text
+            status_ph.info("Preprocessing text...")
+            processed_text = fix_voice_tags(test_text)
+            processed_text = fix_sfx_tags(processed_text)
+            processed_text = preprocess_sfx_in_voice_tags(processed_text)
+            
+            voice_aliases = extract_mixed_voices(processed_text)
+            
+            # Split into timeline
+            SPLIT_PATTERN = re.compile(r'(\x5Bsfx:[a-z0-9_]+\x5D|\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D)', re.IGNORECASE)
+            parts = [p for p in SPLIT_PATTERN.split(processed_text) if p.strip()]
+            
+            timeline = []
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                
+                sfx_match = re.match(r'\x5Bsfx:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
+                bgsfx_start_match = re.match(r'\x5Bbgsfx:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
+                
+                if sfx_match:
+                    timeline.append({'type': 'sfx', 'name': sfx_match.group(1).lower()})
+                elif bgsfx_start_match:
+                    timeline.append({'type': 'bgsfx_start', 'name': bgsfx_start_match.group(1).lower()})
+                elif part.lower() == '[/bgsfx]':
+                    timeline.append({'type': 'bgsfx_stop'})
+                else:
+                    kokoro_text = convert_to_kokoro_format(part, voice_aliases)
+                    kokoro_text = re.sub(r'^#{1,6}\s+', '', kokoro_text, flags=re.MULTILINE)
+                    kokoro_text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', kokoro_text)
+                    
+                    paragraphs = [p.strip() for p in kokoro_text.split('\n\n') if p.strip()]
+                    for para in paragraphs:
+                        if len(para) > 3:
+                            timeline.append({'type': 'tts', 'text': para})
+            
+            if not timeline:
+                st.error("No text content found after preprocessing.")
+                return
+            
+            tts_count = sum(1 for item in timeline if item['type'] == 'tts')
+            status_ph.info(f"Found {tts_count} TTS segments and {total_sfx} SFX tags. Generating...")
+            
+            # Generate TTS segments
+            tts_dir = test_dir / "segments"
+            tts_dir.mkdir(exist_ok=True)
+            
+            audio_items = []
+            processed_tts = 0
+            errors = []
+            
+            for item in timeline:
+                if item['type'] == 'tts':
+                    audio_file = tts_dir / f"segment_{processed_tts:04d}.mp3"
+                    success = False
+                    
+                    for attempt in range(3):
+                        try:
+                            tts_response = requests.post(
+                                f"{TTS_URL}/audio/speech",
+                                json={
+                                    "model": "kokoro",
+                                    "voice": "af_heart",
+                                    "input": item['text'],
+                                    "allow_voice_tags": True,
+                                    "voice_aliases": voice_aliases,
+                                    "response_format": "mp3"
+                                },
+                                headers={"Authorization": f"Bearer {os.getenv('TTS_API_KEY', 'not-needed')}"},
+                                stream=True,
+                                timeout=600
+                            )
+                            
+                            if tts_response.status_code == 200:
+                                with open(str(audio_file), 'wb') as f:
+                                    for chunk in tts_response.iter_content(chunk_size=8192):
+                                        f.write(chunk)
+                            else:
+                                raise Exception(f"API {tts_response.status_code}: {tts_response.text[:100]}")
+                            
+                            if validate_tts_mp3(str(audio_file)):  # Fast pydub check
+                                audio_items.append({'type': 'tts', 'path': str(audio_file)})
+                                success = True
+                                break
+                            else:
+                                if audio_file.exists():
+                                    audio_file.unlink()
+                        except Exception as e:
+                            if audio_file.exists():
+                                audio_file.unlink()
+                            if attempt < 2:
+                                time.sleep(1)
+                            else:
+                                errors.append(f"Segment {processed_tts}: {e}")
+                    
+                    processed_tts += 1
+                    prog_bar.progress(processed_tts / tts_count)
+                    status_ph.info(f"Generating TTS: {processed_tts}/{tts_count} segments")
+                else:
+                    audio_items.append(item)
+            
+            # Fuse audio
+            status_ph.info("Fusing audio with SFX...")
+            prog_bar.progress(0.9)
+            
+            pause_tts = AudioSegment.silent(duration=800)
+            pause_sfx = AudioSegment.silent(duration=200)
+            combined = AudioSegment.empty()
+            current_bgsfx = None
+            bgsfx_offset = 0
+            
+            for j, item in enumerate(audio_items):
+                if item['type'] == 'tts':
+                    tts_audio = AudioSegment.from_file(item['path'])
+                    tts_duration = len(tts_audio)
+                    
+                    if current_bgsfx:
+                        bgsfx_len = len(current_bgsfx)
+                        needed_duration = tts_duration
+                        start_ms = bgsfx_offset % bgsfx_len
+                        
+                        bgsfx_slice = AudioSegment.empty()
+                        current_pos = 0
+                        while current_pos < needed_duration:
+                            take = min(bgsfx_len - start_ms, needed_duration - current_pos)
+                            bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
+                            current_pos += take
+                            start_ms = 0
+                        
+                        bgsfx_slice = bgsfx_slice - 28
+                        mixed = tts_audio.overlay(bgsfx_slice)
+                        combined += mixed
+                    else:
+                        combined += tts_audio
+                    bgsfx_offset += tts_duration
+                    
+                elif item['type'] == 'sfx':
+                    sfx_path = get_sfx_path(item['name'])
+                    if sfx_path and sfx_path.exists():
+                        try:
+                            sfx = AudioSegment.from_mp3(str(sfx_path)) - 8
+                            sfx_duration = len(sfx)
+                            
+                            if current_bgsfx:
+                                bgsfx_len = len(current_bgsfx)
+                                needed_duration = sfx_duration
+                                start_ms = bgsfx_offset % bgsfx_len
+                                
+                                bgsfx_slice = AudioSegment.empty()
+                                current_pos = 0
+                                while current_pos < needed_duration:
+                                    take = min(bgsfx_len - start_ms, needed_duration - current_pos)
+                                    bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
+                                    current_pos += take
+                                    start_ms = 0
+                                
+                                bgsfx_slice = bgsfx_slice - 28
+                                mixed_sfx = sfx.overlay(bgsfx_slice)
+                                combined += mixed_sfx
+                            else:
+                                combined += sfx
+                            bgsfx_offset += sfx_duration
+                        except Exception as e:
+                            st.warning(f"SFX load failed: {e}")
+                    else:
+                        st.warning(f"SFX not found: {item['name']}")
+                        
+                elif item['type'] == 'bgsfx_start':
+                    sfx_path = get_sfx_path(item['name'])
+                    if sfx_path and sfx_path.exists():
+                        try:
+                            current_bgsfx = AudioSegment.from_mp3(str(sfx_path))
+                        except:
+                            current_bgsfx = None
+                    else:
+                        st.warning(f"BGSFX not found: {item['name']}")
+                        
+                elif item['type'] == 'bgsfx_stop':
+                    current_bgsfx = None
+                    
+                if j < len(audio_items) - 1:
+                    pause_dur = pause_tts if item['type'] == 'tts' else pause_sfx
+                    
+                    if current_bgsfx:
+                        bgsfx_len = len(current_bgsfx)
+                        needed_duration = len(pause_dur)
+                        start_ms = bgsfx_offset % bgsfx_len
+                        
+                        bgsfx_slice = AudioSegment.empty()
+                        current_pos = 0
+                        while current_pos < needed_duration:
+                            take = min(bgsfx_len - start_ms, needed_duration - current_pos)
+                            bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
+                            current_pos += take
+                            start_ms = 0
+                        
+                        bgsfx_slice = bgsfx_slice - 28
+                        combined += bgsfx_slice
+                    else:
+                        combined += pause_dur
+                    bgsfx_offset += len(pause_dur)
+            
+            # Export
+            prog_bar.progress(0.95)
+            output_path = test_dir / "test_output.mp3"
+            combined.export(str(output_path), format="mp3")
+            
+            # Cleanup
+            try:
+                shutil.rmtree(tts_dir)
+            except:
+                pass
+            
+            prog_bar.progress(1.0)
+            status_ph.success(f"✅ TTS generated! Duration: {len(combined)/1000:.1f}s")
+            
+            # Play the audio
+            st.subheader("🎧 Result")
+            st.audio(str(output_path))
+            
+            with open(output_path, "rb") as f:
+                st.download_button("Download Test MP3", f, file_name="tts_test.mp3", mime="audio/mpeg")
+            
+            if errors:
+                with st.expander(f"⚠️ {len(errors)} errors occurred"):
+                    for err in errors:
+                        st.write(f"• {err}")
+            
+        except Exception as e:
+            status_ph.error(f"❌ Error: {e}")
+            prog_bar.progress(0)
 
 def clean_existing_story_page():
     st.header("🧹 Clean Existing Story (Remove Voice Tags)")
