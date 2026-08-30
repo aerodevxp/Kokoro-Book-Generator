@@ -65,29 +65,61 @@ IPA_PATTERN = re.compile(r'\x5B([^\x5D]+)\x5D\x28/([^\x5D]+)/\x29')
 SFX_CACHE_FILE = os.path.join(SFX_DIR, "sfx_cache.json")
 CUSTOM_SFX_DIR = os.path.join(SFX_DIR, "custom")
 
-TEST_STORY = """[bgsfx:rain] The alley was cold and wet. Rain hammered down on the dumpsters, echoing off the brick walls.
+TEST_STORY = """[bgsfx:rain_heavy] The old mansion loomed against the stormy sky. Lightning flickered in the distance.
 
-<af_heart>Raph pulled his jacket tighter, watching the two figures approach through the downpour.</af_heart>
+<af_heart>Eleanor stood at the front door, her hand hovering over the knocker. She wasn't sure she belonged here. The invitation had arrived three days ago — unsigned, sealed with black wax, and containing nothing but an address and a time.</af_heart>
 
-<am_adam>"You're late," [rate:0.9] Adam growled, stepping under the flickering streetlight. "And you brought the money?"</am_adam>
+<af_heart>She knocked. [sfx: door_knock.] The sound echoed through the empty porch. For a long moment, nothing happened.</af_heart>
 
-<af_bella>"He's lying," [pause:0.5s] Bella snapped, stepping out from behind Adam. "I saw him pocket half of it yesterday."</af_bella>
+<af_heart>Then the door creaked open on its own. [sfx:door_creak] Eleanor swallowed hard and stepped inside.</af_heart>
 
-<af_heart>Raph didn't flinch. He knew better than to show fear.</af_heart>
+<am_michael>"You must be Eleanor," [pause:0.5s] a voice said from the shadows. A tall man emerged from the darkness, his silver cane tapping against the marble floor. "I am [Worcester](/wˈʊstər/), the caretaker. Welcome to Ravenscroft."</am_michael>
 
-<am_adam>"Is that true, Raph?" [pause:1s] Adam stepped closer, his fists clenching.</am_adam>
+<af_heart>Eleanor stared at him. "Worcester? Like the city?"</af_heart>
 
-<af_heart>Before Raph could answer, Adam swung. [sfx:punch] The impact sent Raph stumbling back into the wet bricks.</af_heart>
+<am_michael>[rate:0.8] "Like the city, yes. Though I assure you, the pronunciation is the only thing we share."</am_michael>
 
-<af_bella>"Get up!" [rate:1.1] Bella yelled. "Don't let him disrespect you like that!"</af_bella>
+<af_heart>She almost smiled. Almost. [pause:1s] But then she heard it — a faint melody coming from somewhere deep inside the house. Piano. Slow. Sad. Like someone playing a memory.</af_heart>
 
-<af_heart>Raph wiped the blood from his lip. He pushed off the wall and lunged. [sfx:slap] The sharp sound echoed through the alley, silencing the rain for a brief second.</af_heart>
+<af_bella>"That's her," [rate:0.9] a woman's voice called from the top of the staircase. Eleanor looked up. A figure in a red dress descended the steps, her heels clicking with deliberate rhythm. "She plays every night. Has for forty years."</af_bella>
 
-<am_adam>Adam held his cheek, his eyes wide in shock. "You... you actually hit me."</am_adam>
+<af_heart>"Who plays?" Eleanor asked.</af_heart>
 
-<af_heart>The rain continued to pour. [pause:1.5s] Raph stood his ground, waiting for the next move.</af_heart>
+<af_bella>"No one knows her name. [pause:0.5s] We just call her the Lady in White."</af_bella>
 
-[/bgsfx]"""
+<af_heart>The piano stopped abruptly. [sfx:piano_slam] The silence that followed was worse than the music.</af_heart>
+
+<am_michael>[rate:0.7] "She doesn't like visitors," Worcester said quietly. "Especially not tonight."</am_michael>
+
+<af_heart>"Why tonight?"</af_heart>
+
+<af_bella(2)+af_nova(1)>"Because tonight is the anniversary," the woman on the stairs said — her voice shifting, becoming something older, something that didn't belong to her. "Tonight is the night she died. And tonight is the night she remembers."</af_bella(2)+af_nova(1)>
+
+<af_heart>Eleanor felt the temperature drop. [pause:1.5s] The candles on the walls flickered. The front door slammed shut behind her. [sfx: door_slam.]</af_heart>
+
+<af_heart>She was locked inside.</af_heart>
+
+<am_michael>"I suggest you find a room," [rate:0.8] Worcester said, already retreating into the darkness. "And whatever you do — don't follow the music."</am_michael>
+
+<af_heart>Eleanor stood alone in the foyer. The piano began again. [pause:1s] Slow. Sad. Calling her name.</af_heart>
+
+<af_heart>She followed the music.</af_heart>
+
+[/bgsfx]
+
+<af_heart>The storm raged outside, but inside the mansion, the only sound was the piano — and Eleanor's footsteps on the dusty carpet. [sfx: footsteps.] Each step took her deeper into the house, past portraits with eyes that seemed to follow her, past doors that seemed to breathe.</af_heart>
+
+<af_heart>She found the music room at the end of a long hallway. The door was already open. [sfx:door_creak] Inside, a woman in a white gown sat at an antique piano, her back to Eleanor, her fingers moving across the keys with impossible grace.</af_heart>
+
+<af_heart>"Hello?" Eleanor whispered.</af_heart>
+
+<af_heart>The woman stopped playing. [pause:2s] She turned around.</af_heart>
+
+<af_heart>She had no face.</af_heart>
+
+<af_heart>Eleanor screamed. [sfx: scream.] The candles went out. The door slammed. [sfx:door_slam]</af_heart>
+
+[bgsfx:wind_howl] <af_heart>And then there was nothing but the wind, and the dark, and the sound of piano keys pressing themselves in the empty room.</af_heart>"""
 
 @st.cache_resource
 def get_clients():
