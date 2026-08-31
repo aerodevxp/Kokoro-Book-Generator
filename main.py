@@ -1836,7 +1836,7 @@ Write Chapter {chapter_num} again, fixing all voice tag issues. End with [END]""
             "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
             "custom_title": custom_title, "time_period": time_period
         }
-        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=params)
+        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=regen_params)
         log.info(f"Metadata saved. Voices used: {voices_used}")
 
         if not debug_mode:
