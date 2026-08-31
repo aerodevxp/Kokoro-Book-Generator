@@ -15,7 +15,6 @@ from fpdf import FPDF
 from mutagen.id3 import ID3, APIC, TIT2, TPE1
 from dotenv import load_dotenv
 from pydub import AudioSegment
-from pydub.effects import strip_silence
 
 import requests
 import logging
@@ -343,7 +342,25 @@ def load_features():
         features = default_features
     return features
 
-def get_sfx_path(sfx_name):
+def prepare_bgsfx(audio_segment, max_duration_ms=180000, fade_ms=1000):
+    """Trim BGSFX to max_duration and apply fade in/out for smooth loops.
+    
+    Note: If fetch_new_sfx_variant already trimmed via FFmpeg, this is a 
+    safety net for any pre-existing files that are too long.
+    """
+    duration = len(audio_segment)
+    
+    if duration > max_duration_ms:
+        start = (duration - max_duration_ms) // 2
+        audio_segment = audio_segment[start:start + max_duration_ms]
+        log.info(f"Trimmed BGSFX from {duration/1000:.1f}s to {max_duration_ms/1000:.1f}s (took middle section)")
+    
+    if fade_ms > 0 and len(audio_segment) > fade_ms * 2:
+        audio_segment = audio_segment.fade_in(fade_ms).fade_out(fade_ms)
+    
+    return audio_segment
+
+def get_sfx_path(sfx_name, is_background=False):
     sfx_dir = Path(SFX_DIR)
     custom_dir = Path(CUSTOM_SFX_DIR)
     custom_path = custom_dir / f"{sfx_name}.mp3"
@@ -352,7 +369,7 @@ def get_sfx_path(sfx_name):
         if validate_mp3(str(custom_path)):
             return custom_path
         else:
-            log.warning(f"[WARN] Custom SFX '{sfx_name}' corrupt, deleting...")
+            log.warning(f"Custom SFX '{sfx_name}' corrupt, deleting...")
             try: custom_path.unlink()
             except: pass
     
@@ -362,7 +379,7 @@ def get_sfx_path(sfx_name):
         if validate_mp3(str(base_path)):
             variants.append(base_path)
         else:
-            log.warning(f"[WARN] SFX '{sfx_name}' base file corrupt, deleting...")
+            log.warning(f"SFX '{sfx_name}' base file corrupt, deleting...")
             try: base_path.unlink()
             except: pass
     
@@ -372,7 +389,7 @@ def get_sfx_path(sfx_name):
         if validate_mp3(str(variant_path)):
             variants.append(variant_path)
         else:
-            log.warning(f"[WARN] SFX variant '{variant_path.name}' corrupt, deleting...")
+            log.warning(f"SFX variant '{variant_path.name}' corrupt, deleting...")
             try: variant_path.unlink()
             except: pass
     
@@ -384,28 +401,42 @@ def get_sfx_path(sfx_name):
             fetch_new = random.random() < 0.3
     
     if fetch_new:
-        new_path = fetch_new_sfx_variant(sfx_name, variants)
+        # BGSFX: 180s cap, allow trim if nothing found
+        # SFX: 30s cap, do NOT trim (don't want a trimmed ambience as a "door slam")
+        if is_background:
+            new_path = fetch_new_sfx_variant(sfx_name, variants, max_duration=180, can_trim=True)
+        else:
+            new_path = fetch_new_sfx_variant(sfx_name, variants, max_duration=30, can_trim=False)
         if new_path:
             return new_path
     
     if variants:
         return random.choice(variants)
     
-    log.warning(f"[WARN] SFX '{sfx_name}' not found or all variants corrupt")
+    log.warning(f"SFX '{sfx_name}' not found or all variants corrupt")
     return None
 
-def fetch_new_sfx_variant(sfx_name, existing_variants):
+def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim=False):
+    """Fetch SFX using Freesound API duration filter + FFmpeg processing.
+    
+    Args:
+        max_duration: Hard cap for initial search (seconds)
+        can_trim: If True, retry with wider cap and trim later (for BGSFX)
+    """
     sfx_dir = Path(SFX_DIR)
     cache = load_sfx_cache()
     downloaded_ids = set(cache.get(sfx_name, []))
     
-    try:
-        log.warning(f"[INFO] Fetching new SFX variant for '{sfx_name}' from Freesound...")
+    def search_with_cap(cap):
+        t0 = time.time()
+        # Use Freesound's Solr filter syntax for duration range
+        duration_filter = f"duration:[0 TO {cap}]"
+        
         search_response = requests.get(
             "https://freesound.org/apiv2/search/text/",
             params={
                 "query": sfx_name.replace("_", " "),
-                "filter": "license:\"Creative Commons 0\"",
+                "filter": f'license:"Creative Commons 0" {duration_filter}',
                 "sort": "rating_desc",
                 "fields": "id,name,duration,previews",
                 "page_size": 15
@@ -413,41 +444,67 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
             headers={"Authorization": f"Token {FREESOUND_API_KEY}"},
             timeout=15
         )
+        log.info(f"  [1/5] Search (cap={cap}s): {search_response.status_code} in {time.time()-t0:.1f}s")
         
         if search_response.status_code != 200:
-            log.warning(f"[WARN] Freesound search failed: {search_response.status_code}")
-            return None
+            log.warning(f"  Freesound search failed: {search_response.status_code}")
+            return None, []
         
         results = search_response.json().get("results", [])
-        if not results:
-            log.warning(f"[WARN] No Freesound results for '{sfx_name}'")
-            return None
+        log.info(f"  [1/5] Found {len(results)} results (cap={cap}s)")
         
         candidates = []
         for result in results:
             if result["id"] in downloaded_ids:
                 continue
-            if result.get("duration", 999) < 10:
+            duration = result.get("duration", 999)
+            # Double-check duration (API should have filtered, but be safe)
+            if duration > cap:
+                log.info(f"  [1/5] Skipping ID {result['id']} (too long: {duration:.1f}s, cap={cap}s)")
+                continue
+            if duration < 10:
                 candidates.insert(0, result)
             else:
                 candidates.append(result)
         
+        return None, candidates
+    
+    try:
+        log.info(f"Fetching new SFX variant for '{sfx_name}' from Freesound...")
+        
+        # STEP 1: Search with the strict cap
+        _, candidates = search_with_cap(max_duration)
+        
+        # STEP 1b: If BGSFX and nothing found, retry with wider cap (will trim later)
+        if not candidates and can_trim:
+            wider_cap = max(max_duration * 3, 600)  # 3x cap or 600s, whichever is larger
+            log.info(f"  [1/5] No results under {max_duration}s, retrying with {wider_cap}s cap (will trim)")
+            _, candidates = search_with_cap(wider_cap)
+        
         if not candidates:
-            log.warning(f"[INFO] All Freesound results for '{sfx_name}' already downloaded")
+            log.info(f"  No suitable Freesound results for '{sfx_name}'")
             return None
         
-        pick = random.choice(candidates[:3])
+        # Pick shortest from top 5
+        pick = min(candidates[:5], key=lambda r: r.get("duration", 999))
+        actual_duration = pick.get("duration", 0)
+        will_trim = actual_duration > max_duration
+        log.info(f"  [1/5] Picked ID {pick['id']} (duration: {actual_duration:.1f}s{' [WILL TRIM]' if will_trim else ''})")
+        
         preview_url = pick["previews"].get("preview-hq-mp3")
         if not preview_url:
             preview_url = pick["previews"].get("preview-lq-mp3")
-        
         if not preview_url:
-            log.warning(f"[WARN] No preview URL for Freesound result")
+            log.warning(f"  No preview URL for Freesound result")
             return None
         
+        # STEP 2: Download
+        t0 = time.time()
         audio_response = requests.get(preview_url, timeout=90)
+        log.info(f"  [2/5] Downloaded {len(audio_response.content)} bytes in {time.time()-t0:.1f}s")
+        
         if audio_response.status_code != 200:
-            log.warning(f"[WARN] Freesound download failed: {audio_response.status_code}")
+            log.warning(f"  Freesound download failed: {audio_response.status_code}")
             return None
         
         variant_num = len(existing_variants) + 1
@@ -460,38 +517,100 @@ def fetch_new_sfx_variant(sfx_name, existing_variants):
         with open(temp_path, 'wb') as f:
             f.write(audio_response.content)
         
-        if not validate_mp3(str(temp_path)):
-            log.warning(f"[WARN] Downloaded SFX for '{sfx_name}' was corrupt or invalid. Discarding.")
+        # STEP 3: Probe
+        t0 = time.time()
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 
+             'format=duration:stream=channels,sample_rate', 
+             '-of', 'default=noprint_wrappers=1:nokey=1', str(temp_path)],
+            capture_output=True, text=True, timeout=10
+        )
+        if probe.returncode != 0:
+            log.warning(f"  [3/5] ffprobe failed in {time.time()-t0:.1f}s: {probe.stderr[:200]}")
             temp_path.unlink()
             return None
         
-        audio = AudioSegment.from_mp3(str(temp_path))
-        audio = strip_silence(audio, silence_thresh=-40, padding=300)
+        probe_lines = probe.stdout.strip().split('\n')
+        duration = 0
+        channels = 0
+        sample_rate = 0
+        for line in probe_lines:
+            try:
+                val = float(line.strip())
+                if duration == 0:
+                    duration = val
+                elif channels == 0:
+                    channels = int(val)
+                elif sample_rate == 0:
+                    sample_rate = int(val)
+            except:
+                pass
         
-        target_dbfs = -20
-        change = target_dbfs - audio.dBFS
-        audio = audio.apply_gain(change)
+        log.info(f"  [3/5] Probed in {time.time()-t0:.1f}s ({duration:.1f}s, {channels}ch, {sample_rate}Hz)")
         
-        audio.export(str(variant_path), format="mp3")
+        if duration < 0.1:
+            log.warning(f"  Too short ({duration:.1f}s). Discarding.")
+            temp_path.unlink()
+            return None
+        
+        # STEP 4: Normalize + (trim if needed) + export in one FFmpeg pass
+        t0 = time.time()
+        
+        # Build filter chain
+        filters = ['loudnorm=I=-20:TP=-2:LRA=11']
+        
+        if will_trim:
+            # Trim to max_duration (take from middle for consistent ambience)
+            trim_start = (duration - max_duration) / 2
+            filters.append(f'trim={trim_start:.2f}:{trim_start + max_duration:.2f}')
+            # Fade in/out for seamless loop
+            fade_duration = min(1.0, max_duration / 4)
+            filters.append(f'afade=t=in:st={trim_start:.2f}:d={fade_duration:.2f}')
+            filters.append(f'afade=t=out:st={trim_start + max_duration - fade_duration:.2f}:d={fade_duration:.2f}')
+            log.info(f"  [4/5] Will trim {duration:.1f}s → {max_duration}s (from {trim_start:.1f}s) + fade")
+        else:
+            # No trim, just normalize
+            pass
+        
+        cmd = [
+            'ffmpeg', '-y', '-i', str(temp_path),
+            '-af', ','.join(filters),
+            '-c:a', 'libmp3lame', '-b:a', '128k',
+            '-ar', '44100',
+            '-ac', '2',
+            str(variant_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode != 0:
+            log.warning(f"  [4/5] FFmpeg failed in {time.time()-t0:.1f}s")
+            log.warning(f"  stderr: {result.stderr[:300]}")
+            temp_path.unlink()
+            return None
+        
+        log.info(f"  [4/5] Processed in {time.time()-t0:.1f}s ({variant_path.stat().st_size} bytes)")
         temp_path.unlink()
         
-        # VALIDATE BEFORE CACHING
+        # STEP 5: Validate
+        t0 = time.time()
         if not validate_mp3(str(variant_path)):
-            log.warning(f"[WARN] Downloaded SFX for '{sfx_name}' failed validation after export. Discarding.")
+            log.warning(f"  [5/5] Validation FAILED in {time.time()-t0:.1f}s. Discarding.")
             try: variant_path.unlink()
             except: pass
             return None
+        
+        log.info(f"  [5/5] Validated in {time.time()-t0:.1f}s")
         
         if sfx_name not in cache:
             cache[sfx_name] = []
         cache[sfx_name].append(pick["id"])
         save_sfx_cache(cache)
         
-        log.warning(f"[INFO] Cached new SFX variant: {variant_path} (Freesound ID: {pick['id']})")
+        log.info(f"  ✅ Cached: {variant_path} (ID: {pick['id']})")
         return variant_path
         
     except Exception as e:
-        log.warning(f"[ERROR] Freesound fetch failed for '{sfx_name}': {e}")
+        log.error(f"Freesound fetch failed for '{sfx_name}': {e}", exc_info=True)
         temp_path = sfx_dir / f"{sfx_name}_temp.mp3"
         if temp_path.exists():
             try: temp_path.unlink()
@@ -1772,7 +1891,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 bgsfx_offset += tts_duration
                 
             elif item['type'] == 'sfx':
-                sfx_path = get_sfx_path(item['name'])
+                sfx_path = get_sfx_path(item['name'], is_background=False)
                 if sfx_path and sfx_path.exists():
                     try:
                         sfx = AudioSegment.from_mp3(str(sfx_path)) - 8
@@ -1798,21 +1917,21 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                             chunk_audio += sfx
                         bgsfx_offset += sfx_duration
                     except Exception as e:
-                        log.warning(f"[ERROR] SFX load failed: {e}")
+                        log.error(f"SFX load failed: {e}")
                 else:
-                    log.warning(f"[WARN] SFX not found: {item['name']}")
+                    log.warning(f"SFX not found: {item['name']}")
                     
             elif item['type'] == 'bgsfx_start':
-                sfx_path = get_sfx_path(item['name'])
+                sfx_path = get_sfx_path(item['name'], is_background=True)
                 if sfx_path and sfx_path.exists():
                     try:
-                        current_bgsfx = AudioSegment.from_mp3(str(sfx_path))
-                        log.warning(f"[INFO] BGSFX started: {item['name']}")
+                        current_bgsfx = prepare_bgsfx(AudioSegment.from_mp3(str(sfx_path)))
+                        log.info(f"BGSFX started: {item['name']} ({len(current_bgsfx)/1000:.1f}s)")
                     except Exception as e:
-                        log.warning(f"[ERROR] BGSFX load failed: {e}")
+                        log.error(f"BGSFX load failed: {e}")
                         current_bgsfx = None
                 else:
-                    log.warning(f"[WARN] BGSFX not found: {item['name']}")
+                    log.warning(f"BGSFX not found: {item['name']}")
                     
             elif item['type'] == 'bgsfx_stop':
                 current_bgsfx = None
@@ -1855,12 +1974,20 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         log.warning(f"[INFO] Fused chunk {chunk_num} ({i+chunk_size}/{len(audio_items)} segments)")
         
     update_job_status(job_id, "running", 0.99, "Finalizing audiobook with FFmpeg...")
-    log.warning("[INFO] Finalizing audiobook with FFmpeg...")
+    log.info("Finalizing audiobook with FFmpeg...")
     
     list_file = story_dir / "ffmpeg_list.txt"
     with open(list_file, 'w') as f:
         for chunk_path in chunk_files:
-            f.write(f"file '{chunk_path}'\n")
+            rel_path = chunk_path.relative_to(story_dir)
+            f.write(f"file '{rel_path}'\n")
+    
+    # PUT IT RIGHT HERE — verify chunks exist before concat
+    missing = [p for p in chunk_files if not p.exists()]
+    if missing:
+        log.error(f"Missing {len(missing)} chunk files before concat!")
+        update_job_status(job_id, "error", 0, f"Missing {len(missing)} chunk files")
+        return None
     
     cmd = [
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
@@ -1870,12 +1997,12 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     ]
     
     try:
+        log.info(f"FFmpeg command: {' '.join(cmd)}")
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        log.info(f"FFmpeg completed successfully")
     except subprocess.CalledProcessError as e:
+        log.error(f"FFmpeg concat failed: {e.stderr[:500]}")
         update_job_status(job_id, "error", 0, f"FFmpeg concat failed: {e.stderr[:300]}")
-        return None
-    except Exception as e:
-        update_job_status(job_id, "error", 0, f"Failed to export audiobook: {e}")
         return None
     
     list_file.unlink()
@@ -2968,7 +3095,7 @@ def tts_tester_page():
                     bgsfx_offset += tts_duration
                     
                 elif item['type'] == 'sfx':
-                    sfx_path = get_sfx_path(item['name'])
+                    sfx_path = get_sfx_path(item['name'], is_background=False)
                     if sfx_path and sfx_path.exists():
                         try:
                             sfx = AudioSegment.from_mp3(str(sfx_path)) - 8
@@ -2999,10 +3126,10 @@ def tts_tester_page():
                         st.warning(f"SFX not found: {item['name']}")
                         
                 elif item['type'] == 'bgsfx_start':
-                    sfx_path = get_sfx_path(item['name'])
+                    sfx_path = get_sfx_path(item['name'], is_background=True)
                     if sfx_path and sfx_path.exists():
                         try:
-                            current_bgsfx = AudioSegment.from_mp3(str(sfx_path))
+                            current_bgsfx = prepare_bgsfx(AudioSegment.from_mp3(str(sfx_path)))
                         except:
                             current_bgsfx = None
                     else:
