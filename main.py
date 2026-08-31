@@ -283,7 +283,7 @@ SOUND EFFECTS (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
 - You can use ANY descriptive effect name, SFW OR NSFW. If it's not cached locally, it will be fetched automatically.
 - Use descriptive names: door_creak, glass_shatter, wolf_howl, sword_clash, rain_heavy, crowd_market
 - Place SFX tags INSIDE voice tags where the sound should occur.
-- Available effects already cached: {sfx_str}
+- Available effects already cached. Prioritize using these if possible: {sfx_str}
 
 Example (Interrupting SFX):
 <af_heart>The door opened slowly. [sfx:door_creak] Sarah walked in.</af_heart>
@@ -2031,7 +2031,7 @@ Write Chapter {chapter_num} again, fixing all voice tag issues. End with [END]""
             "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
             "custom_title": custom_title, "time_period": time_period
         }
-        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=params)
+        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=regen_params)
         log.info(f"Metadata saved. Voices used: {voices_used}")
 
         if chapter_summaries:
@@ -3044,7 +3044,7 @@ def job_status_page():
                 with col_retry:
                     if st.button(f"🔄 Retry Job", key=f"retry_{job_id}"):
                         new_job_id = str(int(time.time()))
-                        params = job.get('params', {})
+                        params = job.get('params') or {}
                         
                         if job_type == 'story':
                             ref_story = Path(params['reference_story']) if params.get('reference_story') else None
@@ -3972,7 +3972,7 @@ def clean_existing_story_page():
                 with col1:
                     if st.button(f"🔄 Retry Job", key=f"retry_{job_id}"):
                         new_job_id = str(int(time.time()))
-                        params = job.get('params', {})
+                        params = job.get('params') or {}
                         
                         if job['job_type'] == 'story':
                             ref_story = Path(params['reference_story']) if params.get('reference_story') else None
@@ -4014,7 +4014,7 @@ def clean_existing_story_page():
                         st.rerun()
                 with col_regen:
                     if st.button(f"🔄 Regen Fresh", key=f"regen_fresh_{job_id}"):
-                        params = job.get('params', {})
+                        params = job.get('params') or {}
                         new_job_id = str(int(time.time()))
                         
                         if job_type == 'story':
