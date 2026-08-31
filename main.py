@@ -20,6 +20,23 @@ import requests
 import logging
 from logging.handlers import RotatingFileHandler
 
+import signal
+import sys
+
+def force_exit(signum, frame):
+    log.warning(f"Received signal {signum}, force exiting...")
+    os._exit(0)
+
+# Signal handlers can only be registered in the main thread.
+# Streamlit runs scripts in a worker thread, so this might fail.
+# Wrap it so the script doesn't crash if it can't register.
+try:
+    signal.signal(signal.SIGINT, force_exit)
+    signal.signal(signal.SIGTERM, force_exit)
+except (ValueError, OSError):
+    import atexit
+    atexit.register(lambda: os._exit(0))
+
 load_dotenv()
 
 # Configuration
@@ -263,7 +280,7 @@ SOUND EFFECTS (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
 - Use [sfx:effect_name] to insert a sound effect that interrupts speech.
 - Use [bgsfx:effect_name] to start a background sound effect, and [/bgsfx] to stop it (the closing tag cannot contain the effect name. only one bg can be played at a time, so choose wisely).
 - Background sounds continue across multiple paragraphs/voice clips until stopped.
-- You can use ANY descriptive effect name. If it's not cached locally, it will be fetched automatically.
+- You can use ANY descriptive effect name, SFW OR NSFW. If it's not cached locally, it will be fetched automatically.
 - Use descriptive names: door_creak, glass_shatter, wolf_howl, sword_clash, rain_heavy, crowd_market
 - Place SFX tags INSIDE voice tags where the sound should occur.
 - Available effects already cached: {sfx_str}
@@ -286,8 +303,8 @@ CONTROL TOKENS (for TTS only — these will be removed from the text/PDF version
 - These tokens go INSIDE the voice tags, mixed with the dialogue/narration text.
 
 NARRATION VOICE:
-- For omniscient/third-person objective narration: use af_heart
-- For first-person POV: use the POV character's voice for narration AND internal thoughts
+- For omniscient/third-person objective narration: always use af_heart
+- For first-person POV: use the POV character's voice for first-person narration AND internal thoughts
 - For limited third-person POV: use the focal character's voice for narration
 - If the story switches POVs between scenes, use whichever character's perspective the current scene is from
 - You decide the best narration style based on the story content
@@ -383,8 +400,15 @@ def get_sfx_path(sfx_name, is_background=False):
             try: base_path.unlink()
             except: pass
     
+    # FIXED: Only match exact variants (sfx_name followed by _digits only)
     for variant_path in sfx_dir.glob(f"{sfx_name}_*.mp3"):
         if "_temp" in variant_path.name:
+            continue
+        # Extract suffix after sfx_name_
+        suffix = variant_path.stem[len(sfx_name) + 1:]
+        # Only accept if suffix is purely numeric (2, 3, etc.)
+        # Reject if suffix contains letters (gentle, heavy, etc.)
+        if not re.match(r'^\d+$', suffix):
             continue
         if validate_mp3(str(variant_path)):
             variants.append(variant_path)
@@ -401,8 +425,6 @@ def get_sfx_path(sfx_name, is_background=False):
             fetch_new = random.random() < 0.3
     
     if fetch_new:
-        # BGSFX: 180s cap, allow trim if nothing found
-        # SFX: 30s cap, do NOT trim (don't want a trimmed ambience as a "door slam")
         if is_background:
             new_path = fetch_new_sfx_variant(sfx_name, variants, max_duration=180, can_trim=True)
         else:
@@ -417,19 +439,21 @@ def get_sfx_path(sfx_name, is_background=False):
     return None
 
 def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim=False):
-    """Fetch SFX using Freesound API duration filter + FFmpeg processing.
-    
-    Args:
-        max_duration: Hard cap for initial search (seconds)
-        can_trim: If True, retry with wider cap and trim later (for BGSFX)
-    """
+    """Fetch SFX using Freesound API duration filter + FFmpeg processing."""
     sfx_dir = Path(SFX_DIR)
     cache = load_sfx_cache()
     downloaded_ids = set(cache.get(sfx_name, []))
     
+    # Track file hashes to avoid duplicate content under different IDs
+    hash_cache_path = sfx_dir / "sfx_hashes.json"
+    try:
+        with open(hash_cache_path, 'r') as f:
+            existing_hashes = set(json.load(f))
+    except:
+        existing_hashes = set()
+    
     def search_with_cap(cap):
         t0 = time.time()
-        # Use Freesound's Solr filter syntax for duration range
         duration_filter = f"duration:[0 TO {cap}]"
         
         search_response = requests.get(
@@ -437,30 +461,29 @@ def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim
             params={
                 "query": sfx_name.replace("_", " "),
                 "filter": f'license:"Creative Commons 0" {duration_filter}',
-                "sort": "rating_desc",
+                "sort": "downloads_desc",  # CHANGED: most downloaded = most reliable
                 "fields": "id,name,duration,previews",
                 "page_size": 15
             },
             headers={"Authorization": f"Token {FREESOUND_API_KEY}"},
             timeout=15
         )
-        log.info(f"  [1/5] Search (cap={cap}s): {search_response.status_code} in {time.time()-t0:.1f}s")
+        log.info(f"  [1/6] Search (cap={cap}s, sort=downloads): {search_response.status_code} in {time.time()-t0:.1f}s")
         
         if search_response.status_code != 200:
             log.warning(f"  Freesound search failed: {search_response.status_code}")
             return None, []
         
         results = search_response.json().get("results", [])
-        log.info(f"  [1/5] Found {len(results)} results (cap={cap}s)")
+        log.info(f"  [1/6] Found {len(results)} results (cap={cap}s)")
         
         candidates = []
         for result in results:
             if result["id"] in downloaded_ids:
                 continue
             duration = result.get("duration", 999)
-            # Double-check duration (API should have filtered, but be safe)
             if duration > cap:
-                log.info(f"  [1/5] Skipping ID {result['id']} (too long: {duration:.1f}s, cap={cap}s)")
+                log.info(f"  [1/6] Skipping ID {result['id']} (too long: {duration:.1f}s, cap={cap}s)")
                 continue
             if duration < 10:
                 candidates.insert(0, result)
@@ -472,24 +495,21 @@ def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim
     try:
         log.info(f"Fetching new SFX variant for '{sfx_name}' from Freesound...")
         
-        # STEP 1: Search with the strict cap
         _, candidates = search_with_cap(max_duration)
         
-        # STEP 1b: If BGSFX and nothing found, retry with wider cap (will trim later)
         if not candidates and can_trim:
-            wider_cap = max(max_duration * 3, 600)  # 3x cap or 600s, whichever is larger
-            log.info(f"  [1/5] No results under {max_duration}s, retrying with {wider_cap}s cap (will trim)")
+            wider_cap = max(max_duration * 3, 600)
+            log.info(f"  [1/6] No results under {max_duration}s, retrying with {wider_cap}s cap (will trim)")
             _, candidates = search_with_cap(wider_cap)
         
         if not candidates:
             log.info(f"  No suitable Freesound results for '{sfx_name}'")
             return None
         
-        # Pick shortest from top 5
         pick = min(candidates[:5], key=lambda r: r.get("duration", 999))
         actual_duration = pick.get("duration", 0)
         will_trim = actual_duration > max_duration
-        log.info(f"  [1/5] Picked ID {pick['id']} (duration: {actual_duration:.1f}s{' [WILL TRIM]' if will_trim else ''})")
+        log.info(f"  [1/6] Picked ID {pick['id']} (duration: {actual_duration:.1f}s{' [WILL TRIM]' if will_trim else ''})")
         
         preview_url = pick["previews"].get("preview-hq-mp3")
         if not preview_url:
@@ -501,10 +521,22 @@ def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim
         # STEP 2: Download
         t0 = time.time()
         audio_response = requests.get(preview_url, timeout=90)
-        log.info(f"  [2/5] Downloaded {len(audio_response.content)} bytes in {time.time()-t0:.1f}s")
+        log.info(f"  [2/6] Downloaded {len(audio_response.content)} bytes in {time.time()-t0:.1f}s")
         
         if audio_response.status_code != 200:
             log.warning(f"  Freesound download failed: {audio_response.status_code}")
+            return None
+        
+        # STEP 2b: Hash check for deduplication
+        import hashlib
+        file_hash = hashlib.md5(audio_response.content).hexdigest()
+        if file_hash in existing_hashes:
+            log.info(f"  [2b/6] Duplicate content (hash matches existing file). Skipping.")
+            # Still cache the ID so we don't re-download it
+            if sfx_name not in cache:
+                cache[sfx_name] = []
+            cache[sfx_name].append(pick["id"])
+            save_sfx_cache(cache)
             return None
         
         variant_num = len(existing_variants) + 1
@@ -526,7 +558,7 @@ def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim
             capture_output=True, text=True, timeout=10
         )
         if probe.returncode != 0:
-            log.warning(f"  [3/5] ffprobe failed in {time.time()-t0:.1f}s: {probe.stderr[:200]}")
+            log.warning(f"  [3/6] ffprobe failed in {time.time()-t0:.1f}s: {probe.stderr[:200]}")
             temp_path.unlink()
             return None
         
@@ -546,31 +578,31 @@ def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim
             except:
                 pass
         
-        log.info(f"  [3/5] Probed in {time.time()-t0:.1f}s ({duration:.1f}s, {channels}ch, {sample_rate}Hz)")
+        log.info(f"  [3/6] Probed in {time.time()-t0:.1f}s ({duration:.1f}s, {channels}ch, {sample_rate}Hz)")
         
         if duration < 0.1:
             log.warning(f"  Too short ({duration:.1f}s). Discarding.")
             temp_path.unlink()
             return None
         
-        # STEP 4: Normalize + (trim if needed) + export in one FFmpeg pass
+        # STEP 4: Normalize + trim + fade + export
         t0 = time.time()
         
-        # Build filter chain
         filters = ['loudnorm=I=-20:TP=-2:LRA=11']
         
         if will_trim:
-            # Trim to max_duration (take from middle for consistent ambience)
+            # BGSFX: trim to max_duration with fade in/out
             trim_start = (duration - max_duration) / 2
             filters.append(f'trim={trim_start:.2f}:{trim_start + max_duration:.2f}')
-            # Fade in/out for seamless loop
             fade_duration = min(1.0, max_duration / 4)
             filters.append(f'afade=t=in:st={trim_start:.2f}:d={fade_duration:.2f}')
             filters.append(f'afade=t=out:st={trim_start + max_duration - fade_duration:.2f}:d={fade_duration:.2f}')
-            log.info(f"  [4/5] Will trim {duration:.1f}s → {max_duration}s (from {trim_start:.1f}s) + fade")
-        else:
-            # No trim, just normalize
-            pass
+            log.info(f"  [4/6] Will trim {duration:.1f}s → {max_duration}s + fade in/out")
+        elif duration > 30 and not can_trim:
+            # SFX (non-BGSFX): hard cap at 30s with fade out only
+            filters.append(f'atrim=0:30')
+            filters.append(f'afade=t=out:st=29:d=1')
+            log.info(f"  [4/6] SFX too long ({duration:.1f}s), trimming to 30s with fade out")
         
         cmd = [
             'ffmpeg', '-y', '-i', str(temp_path),
@@ -583,30 +615,35 @@ def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=60, can_trim
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         
         if result.returncode != 0:
-            log.warning(f"  [4/5] FFmpeg failed in {time.time()-t0:.1f}s")
+            log.warning(f"  [4/6] FFmpeg failed in {time.time()-t0:.1f}s")
             log.warning(f"  stderr: {result.stderr[:300]}")
             temp_path.unlink()
             return None
         
-        log.info(f"  [4/5] Processed in {time.time()-t0:.1f}s ({variant_path.stat().st_size} bytes)")
+        log.info(f"  [4/6] Processed in {time.time()-t0:.1f}s ({variant_path.stat().st_size} bytes)")
         temp_path.unlink()
         
         # STEP 5: Validate
         t0 = time.time()
         if not validate_mp3(str(variant_path)):
-            log.warning(f"  [5/5] Validation FAILED in {time.time()-t0:.1f}s. Discarding.")
+            log.warning(f"  [5/6] Validation FAILED in {time.time()-t0:.1f}s. Discarding.")
             try: variant_path.unlink()
             except: pass
             return None
         
-        log.info(f"  [5/5] Validated in {time.time()-t0:.1f}s")
+        log.info(f"  [5/6] Validated in {time.time()-t0:.1f}s")
         
+        # STEP 6: Update caches (IDs + hashes)
         if sfx_name not in cache:
             cache[sfx_name] = []
         cache[sfx_name].append(pick["id"])
         save_sfx_cache(cache)
         
-        log.info(f"  ✅ Cached: {variant_path} (ID: {pick['id']})")
+        existing_hashes.add(file_hash)
+        with open(hash_cache_path, 'w') as f:
+            json.dump(list(existing_hashes), f)
+        
+        log.info(f"  ✅ Cached: {variant_path} (ID: {pick['id']}, hash: {file_hash[:8]})")
         return variant_path
         
     except Exception as e:
@@ -624,7 +661,11 @@ def get_available_sfx():
         for f in sfx_dir.glob("*.mp3"):
             if "_temp" in f.name:
                 continue
-            sfx_names.add(f.stem)
+            # Only return BASE names (strip _N suffix from variants)
+            stem = f.stem
+            base_name = re.sub(r'_\d+$', '', stem)
+            if base_name:
+                sfx_names.add(base_name)
     
     custom_dir = Path(CUSTOM_SFX_DIR)
     if custom_dir.exists():
@@ -807,10 +848,22 @@ def load_story_context(story_path, job_id=None):
             with open(summary_path, 'r') as f:
                 summary = f.read()
         else:
-            log.warning(f"[INFO] No summary found for '{story_path.stem}', generating one...")
+            log.warning(f"No summary found for '{story_path.stem}', generating one...")
             summary = generate_story_summary(story_path, job_id)
         
-        return f"Reference Story Summary (from '{story_path.stem}'):\n{summary}\n\n"
+        context = f"Reference Story Summary (from '{story_path.stem}'):\n{summary}\n\n"
+        
+        # NEW: Load time period for chronological awareness
+        meta_path = story_path.parent / f"{story_path.stem}_metadata.json"
+        if meta_path.exists():
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+                time_period = meta.get("time_period")
+                if time_period:
+                    context += f"Time Period: {time_period}\n"
+        
+        context += "\n"
+        return context
     except Exception as e:
         log.warning(f"Error loading/generating story summary: {e}")
         return ""
@@ -852,7 +905,7 @@ def remove_voice_tags(text):
     clean_text = re.sub(r'  +', ' ', clean_text)
     return clean_text
 
-def save_metadata(title, story_type, reference_story, worldbook_used, features_used, story_dir, voices_used=None):
+def save_metadata(title, story_type, reference_story, worldbook_used, features_used, story_dir, voices_used=None, time_period=None, generation_params=None):
     metadata = {
         "title": title,
         "story_type": story_type,
@@ -860,6 +913,8 @@ def save_metadata(title, story_type, reference_story, worldbook_used, features_u
         "worldbook": str(worldbook_used) if worldbook_used else None,
         "features": features_used,
         "voices_used": voices_used or [],
+        "time_period": time_period,
+        "generation_params": generation_params,  # NEW - saves all settings for regen
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "output_dir": str(story_dir)
     }
@@ -967,8 +1022,65 @@ def correct_voice_typo(voice):
     # If no close match found, return the original (it will get removed as orphaned later)
     return voice_lower
 
+def clean_html_entities_in_text(text):
+    """Clean HTML entities that break voice/SFX tags"""
+    entities = {
+        '&quot;': '"', '&amp;': '&', '&lt;': '<', '&gt;': '>',
+        '&#39;': "'", '&apos;': "'", '&nbsp;': ' ',
+    }
+    for entity, char in entities.items():
+        text = text.replace(entity, char)
+    return text
+
+def validate_chapter_voice_tags(chapter_text):
+    """Validate voice tags in a chapter. Returns (is_valid, issues, cleaned_text)."""
+    issues = []
+    
+    # Clean HTML entities first
+    cleaned = clean_html_entities_in_text(chapter_text)
+    
+    voice_regex = r'(?:am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)_[a-z0-9_+(]+'
+    
+    # Count opening and closing tags
+    opening_tags = re.findall(rf'<({voice_regex})>', cleaned, re.IGNORECASE)
+    closing_tags = re.findall(rf'</({voice_regex})>', cleaned, re.IGNORECASE)
+    
+    # Check balance
+    if len(closing_tags) > len(opening_tags):
+        diff = len(closing_tags) - len(opening_tags)
+        issues.append(f"Orphaned closing tags: {diff} extra </tag> without opening")
+    
+    if len(opening_tags) > len(closing_tags):
+        diff = len(opening_tags) - len(closing_tags)
+        issues.append(f"Orphaned opening tags: {diff} extra <tag> without closing")
+    
+    # Check for malformed tags (still containing entities after cleaning)
+    malformed = re.findall(r'<[^>]*(?:&\w+;|&#\d+;)[^>]*>', cleaned)
+    if malformed:
+        issues.append(f"Malformed tags with residual HTML entities: {len(malformed)}")
+    
+    # Check for unclosed tags at end of text
+    trailing_open = re.findall(rf'<({voice_regex})>\s*$', cleaned, re.IGNORECASE)
+    if trailing_open:
+        issues.append(f"Unclosed tag at end: {trailing_open}")
+    
+    # Check for tags spanning multiple paragraphs (opening in one para, closing in another)
+    paragraphs = cleaned.split('\n\n')
+    for para in paragraphs:
+        opens = len(re.findall(rf'<({voice_regex})>', para, re.IGNORECASE))
+        closes = len(re.findall(rf'</({voice_regex})>', para, re.IGNORECASE))
+        if opens != closes:
+            # This is OK if tags span paragraphs, but we instructed AI not to do this
+            # Only flag if it's clearly broken (e.g., 2 opens 0 closes in same para)
+            if opens > 0 and closes == 0 and opens > 1:
+                issues.append(f"Paragraph with {opens} opening tags but no closing tags")
+                break
+    
+    is_valid = len(issues) == 0
+    return is_valid, issues, cleaned
+
 def fix_voice_tags(text):
-    """Fixes typos, mismatched voice tags, and removes orphaned tags."""
+    """Fixes typos, mismatched voice tags, repairs orphaned tags, and removes unrepairable tags."""
     voice_regex = r'(?:am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)_[a-z0-9_+(]+'
     
     # 1. Fix typos in all voice tags (e.g., <af_echo> -> <am_echo>)
@@ -981,7 +1093,12 @@ def fix_voice_tags(text):
     
     text = tag_pattern.sub(correct_tag, text)
     
-    # 2. Fix mismatched pairs: <open>content</close> -> <open>content</open>
+    # 2. NEW: Repair orphaned tags (insert missing counterparts)
+    #    This runs BEFORE mismatched pair fix, so orphaned closings get
+    #    an opening inserted, and orphaned openings get a closing appended.
+    text = repair_orphaned_tags(text)
+    
+    # 3. Fix mismatched pairs: <open>content</close> -> <open>content</open>
     pair_pattern = re.compile(rf'<({voice_regex})>([^<]*?)</({voice_regex})>', re.DOTALL | re.IGNORECASE)
     
     def fix_pair(match):
@@ -997,8 +1114,8 @@ def fix_voice_tags(text):
         if new_text == text:
             break
         text = new_text
-        
-    # 3. Protect valid pairs with placeholders
+    
+    # 4. Protect valid pairs with placeholders
     placeholder_map = {}
     def replace_pair(match):
         placeholder = f"__VOICE_PAIR_{len(placeholder_map)}__"
@@ -1007,17 +1124,79 @@ def fix_voice_tags(text):
     
     text = pair_pattern.sub(replace_pair, text)
     
-    # 4. Remove orphaned closing tags
+    # 5. Remove remaining orphaned closing tags (truly unrepairable)
     text = re.sub(rf'</{voice_regex}>', '', text, flags=re.IGNORECASE)
     
-    # 5. Remove orphaned opening tags
+    # 6. Remove remaining orphaned opening tags (truly unrepairable)
     text = re.sub(rf'<{voice_regex}>', '', text, flags=re.IGNORECASE)
     
-    # 6. Restore valid pairs
+    # 7. Restore valid pairs
     for placeholder, original in placeholder_map.items():
         text = text.replace(placeholder, original)
     
     return text
+
+def repair_orphaned_tags(text):
+    """Repair orphaned voice tags by inserting missing counterparts.
+    
+    - Orphaned closing tag → wrap preceding text in matching opening...closing
+    - Orphaned opening tag → append closing at paragraph end
+    
+    This runs BEFORE the removal step in fix_voice_tags, so instead of
+    deleting orphaned tags (losing the AI's voice intent), we repair them.
+    """
+    voice_regex = r'(?:am|af|bm|bf|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)_[a-z0-9_+(]+'
+    tag_pattern = re.compile(rf'(</?)({voice_regex})>', re.IGNORECASE)
+    
+    paragraphs = text.split('\n\n')
+    fixed_paragraphs = []
+    
+    for para in paragraphs:
+        tags = list(tag_pattern.finditer(para))
+        if not tags:
+            fixed_paragraphs.append(para)
+            continue
+        
+        # Rebuild paragraph, tracking open voice stack
+        result = ""
+        pos = 0
+        open_stack = []
+        
+        for t in tags:
+            text_before = para[pos:t.start()]
+            is_opening = (t.group(1) == '<')
+            voice = t.group(2)
+            
+            if is_opening:
+                result += text_before + t.group(0)
+                open_stack.append(voice)
+            else:
+                # Closing tag
+                if open_stack:
+                    # Matched (or mismatched — handled by fix_pair elsewhere)
+                    result += text_before + t.group(0)
+                    open_stack.pop()
+                else:
+                    # Orphaned closing! Wrap the text before it in this voice
+                    result += f"<{voice}>{text_before}</{voice}>"
+            
+            pos = t.end()
+        
+        # Remaining text after last tag
+        remaining_text = para[pos:]
+        
+        # Handle orphaned openings (still in stack)
+        if open_stack:
+            result += remaining_text
+            # Close in reverse order (innermost first)
+            for voice in reversed(open_stack):
+                result += f"</{voice}>"
+        else:
+            result += remaining_text
+        
+        fixed_paragraphs.append(result)
+    
+    return '\n\n'.join(fixed_paragraphs)
 
 def fix_sfx_tags(text):
     """Normalizes SFX tags (fixes spaces, strips punctuation) and auto-closes unclosed BGSFX tags"""
@@ -1385,7 +1564,7 @@ def stream_llm_with_retry(prompt, model, max_tokens, temperature, max_retries=3)
             else:
                 raise e
 
-def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False, custom_title=""):
+def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False, custom_title="", time_period=""):
     cleanup_old_jobs(keep_last=3)
     try:
         def check_cancel():
@@ -1414,7 +1593,7 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
             "features": features, "length_instruction": length_instruction,
             "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
-            "custom_title": custom_title
+            "custom_title": custom_title, "time_period": time_period
         }
         update_job_status(job_id, "running", 0, "Starting generation...", job_type="story", params=params)
         base_prompt = read_base_prompt()
@@ -1435,6 +1614,7 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             title = "Debug Test Story"
             update_job_status(job_id, "running", 0.1, "Debug mode: Loaded test story.", title=title)
             book_summary = ""
+            chapter_summaries = []
         else:
             if quick_test:
                 length_instruction = "Write EXACTLY ONE chapter. Do not write more than 1 chapter."
@@ -1442,6 +1622,7 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
                     topic = "a very short story about a robot learning to paint"
                 update_job_status(job_id, "running", 0, "Quick Test Mode: Generating 1 chapter...")
             
+            # PHASE 1: OUTLINE
             update_job_status(job_id, "running", 0, "Phase 1: Generating Outline...")
             features_instruction = f"The story MUST include these elements: {', '.join(features)}. " if features else ""
             type_instruction = ""
@@ -1450,8 +1631,12 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             elif story_type == "prequel":
                 type_instruction = "This is a PREQUEL - explore events leading up to referenced story with established characters/settings."
             
+            time_instruction = ""
+            if time_period and time_period.strip():
+                time_instruction = f"\nTime Period: This story takes place around {time_period}. Keep this setting consistent.\n"
+            
             prompt = f"""{base_prompt}
-{worldbook_context}{story_context}{voice_instruction}
+{worldbook_context}{story_context}{voice_instruction}{time_instruction}
 Generate a detailed story outline.
 Topic: {topic if topic else 'a compelling story of your choice'}
 Genre: {genre if genre else 'AI decides'}
@@ -1478,15 +1663,52 @@ List each chapter with a brief description."""
                             update_job_status(job_id, "running", min(0.05, token_count / 1000), f"Phase 1: Generating Outline... {token_count} tokens")
             
             update_job_status(job_id, "running", 0.1, f"Phase 1: Outline Complete ({token_count} tokens)")
+            log.info(f"Outline generated ({token_count} tokens, {len(outline)} chars)")
+            
             chapter_matches = re.findall(r'(?:Chapter|chapter)\s+(\d+)', outline, re.IGNORECASE)
             if quick_test:
                 total_chapters = 1
             else:         
                 total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
-            update_job_status(job_id, "running", 0.1, f"Detected {total_chapters} chapters. Starting Phase 2...")
+            update_job_status(job_id, "running", 0.1, f"Detected {total_chapters} chapters.")
+            
+            # PHASE 1b: SYNOPSIS (non-spoiler) for approval
+            if not quick_test and not debug_mode:
+                synopsis_prompt = f"""Based on the following story outline, write a SHORT synopsis (2-3 sentences) that captures the premise and tone WITHOUT spoiling any plot twists or surprises. Do NOT reveal endings or major reveals.
 
-            story_parts = []
+Outline:
+{outline}
+
+Synopsis (no spoilers, 2-3 sentences):"""
+                
+                update_job_status(job_id, "running", 0.12, "Generating synopsis for approval...")
+                log.info("Generating synopsis for approval...")
+                
+                synopsis_response = llm_client.chat.completions.create(
+                    model=STORY_MODEL, messages=[{"role": "user", "content": synopsis_prompt}],
+                    max_tokens=100, temperature=0.5
+                )
+                synopsis = synopsis_response.choices[0].message.content.strip()
+                log.info(f"Synopsis generated: {synopsis[:100]}...")
+                
+                # Save outline to temp file for continuation
+                outline_path = Path(JOBS_DIR) / f"job_{job_id}_outline.txt"
+                with open(outline_path, 'w') as f:
+                    f.write(outline)
+                
+                # Set status to awaiting approval
+                update_job_status(job_id, "awaiting_approval", 0.15, synopsis, title="Awaiting Approval")
+                log.info("Outline awaiting user approval...")
+                return  # Stop here, wait for user to approve
+            
+            # If quick_test or debug_mode, skip approval and continue directly
             chapter_summaries = []
+        
+        # PHASE 2: WRITE STORY (reached via direct call or after approval)
+        # This part is now in a separate function run_story_continuation_worker
+        # But for debug/quick_test, we continue inline:
+        if debug_mode or quick_test:
+            story_parts = []
             
             for chapter_num in range(1, total_chapters + 1):
                 if check_cancel(): return
@@ -1510,12 +1732,8 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                 ch_prompt += " End this chapter with [END]"
                 
                 update_job_status(job_id, "running", chapter_progress, f"Phase 2: Requesting Chapter {chapter_num}/{total_chapters} from AI...")
-                response = stream_llm_with_retry(
-                    prompt=ch_prompt, 
-                    model=STORY_MODEL, 
-                    max_tokens=2048, 
-                    temperature=0.8
-                )
+                log.info(f"Requesting Chapter {chapter_num}/{total_chapters}")
+                response = stream_llm_with_retry(prompt=ch_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.8)
                 
                 chapter = ""
                 ch_tokens = 0
@@ -1526,27 +1744,61 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                             chapter += content
                             ch_tokens += 1
                 
+                log.info(f"Chapter {chapter_num}/{total_chapters} received ({ch_tokens} tokens, {len(chapter)} chars)")
+                
+                # VALIDATE VOICE TAGS - regen if broken
+                is_valid, issues, cleaned_chapter = validate_chapter_voice_tags(chapter)
+                regen_attempts = 0
+                while not is_valid and regen_attempts < 2:
+                    regen_attempts += 1
+                    log.warning(f"Chapter {chapter_num} has voice tag issues: {issues}. Regenerating (attempt {regen_attempts}/2)...")
+                    update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}: fixing voice tags (attempt {regen_attempts})...")
+                    
+                    fix_prompt = f"""{base_prompt}
+{worldbook_context}{story_context}{voice_instruction}
+The previous version of Chapter {chapter_num} had formatting issues with voice tags. Rewrite it carefully ensuring ALL voice tags are properly opened and closed within the same paragraph.
+
+Previous chapter (for reference):
+{chapter}
+
+Write Chapter {chapter_num} again, fixing all voice tag issues. End with [END]"""
+                    
+                    response = stream_llm_with_retry(prompt=fix_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.7)
+                    chapter = ""
+                    ch_tokens = 0
+                    for chunk in response:
+                        if chunk.choices and chunk.choices[0].delta:
+                            content = chunk.choices[0].delta.content
+                            if content:
+                                chapter += content
+                                ch_tokens += 1
+                    
+                    is_valid, issues, cleaned_chapter = validate_chapter_voice_tags(chapter)
+                    log.info(f"Chapter {chapter_num} regen attempt {regen_attempts}: valid={is_valid}, issues={issues}")
+                
+                # Use cleaned version (HTML entities removed)
+                chapter = cleaned_chapter
                 story_parts.append(chapter)
 
-                update_job_status(job_id, "running", chapter_progress, 
-                                 f"Chapter {chapter_num}/{total_chapters} written ({ch_tokens} tokens). Summarizing...")
+                update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}/{total_chapters} written ({ch_tokens} tokens). Summarizing...")
+                log.info(f"Summarizing Chapter {chapter_num}/{total_chapters}...")
                 chapter_summary = generate_chapter_summary(chapter, chapter_num, job_id)
                 chapter_summaries.append(chapter_summary)
+                log.info(f"Chapter {chapter_num}/{total_chapters} summarized")
 
                 chapter_progress = 0.1 + chapter_num / total_chapters * 0.7
                 update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}/{total_chapters} Completed ({ch_tokens} tokens)")
             
             story = "\n\n".join(story_parts)
-
             story = fix_voice_tags(story)
 
             if not story.strip():
                 update_job_status(job_id, "error", 0, "Failed to generate story - empty response from AI")
                 return
             
+            # PHASE 3: TITLE
             update_job_status(job_id, "running", 0.85, "Phase 3: Generating Title...")
             if check_cancel(): return
-             # NEW: Check for custom title first
             if custom_title and custom_title.strip():
                 title = custom_title.strip()
                 update_job_status(job_id, "running", 0.9, f"Using custom title: {title}", title=title)
@@ -1558,7 +1810,6 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                         max_tokens=30, temperature=0.7
                     )
                     title = title_response.choices[0].message.content.strip()
-                    
                     title = re.sub(r'^[*_`#]*(?:Book\s+)?Title[*_`#]*\s*[:\-–]\s*', '', title, flags=re.IGNORECASE)
                     title = re.sub(r'[*`#]+', '', title)
                     title = title.replace('_', ' ')
@@ -1569,12 +1820,24 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                     title = "Untitled-Story"
                 update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
 
-
+        # SAVE + TTS (shared by both paths)
         update_job_status(job_id, "running", 0.9, "Saving files...", title=title)
+        log.info(f"Saving story files for '{title}'...")
         filepath, story_dir = save_story(story, title, series_name)
+        log.info(f"Story saved: {filepath}")
         tts_filepath = save_tts_story(story, title, story_dir)
+        log.info(f"TTS story saved: {tts_filepath}")
         voices_used = extract_voices_used(story)
-        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used)
+        regen_params = {
+            "topic": topic, "genre": genre, "story_type": story_type,
+            "reference_story": str(reference_story) if reference_story else None,
+            "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
+            "features": features, "length_instruction": length_instruction,
+            "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
+            "custom_title": custom_title, "time_period": time_period
+        }
+        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=params)
+        log.info(f"Metadata saved. Voices used: {voices_used}")
 
         if not debug_mode:
             if chapter_summaries:
@@ -1582,8 +1845,10 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                 with open(summaries_path, 'w') as f:
                     json.dump(chapter_summaries, f, indent=2)
                 update_job_status(job_id, "running", 0.92, "Generating book summary from chapter summaries...")
+                log.info("Generating book summary from chapter summaries...")
                 book_summary = generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id)
                 update_job_status(job_id, "running", 0.93, "Book summary generated!")
+                log.info("Book summary generated")
             
         if series_name:
             add_story_to_series(series_name, title, story_type, reference_story, filepath,
@@ -1605,8 +1870,207 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                     update_job_status(job_id, "running", 0.97, "Cover art embedded in audiobook!")
         
         update_job_status(job_id, "completed", 1.0, "Generation Complete!", files, title)
+        log.info("Generation complete!")
         
     except Exception as e:
+        log.error(f"Generation worker error: {e}", exc_info=True)
+        update_job_status(job_id, "error", 0, str(e))
+
+
+def run_story_continuation_worker(job_id, outline, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test, custom_title, time_period):
+    """Continue story generation after outline approval."""
+    try:
+        base_prompt = read_base_prompt()
+        
+        character_voices = {}
+        if worldbook_path:
+            with open(worldbook_path, 'r') as f:
+                wb_content = f.read()
+            character_voices = extract_character_voices(wb_content)
+        
+        available_sfx = get_available_sfx()
+        voice_instruction = build_voice_instruction(character_voices if character_voices else None, available_sfx)
+        story_context = load_story_context(reference_story, job_id)
+        worldbook_context = load_worldbook_context(worldbook_path)
+        
+        chapter_matches = re.findall(r'(?:Chapter|chapter)\s+(\d+)', outline, re.IGNORECASE)
+        total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
+        
+        update_job_status(job_id, "running", 0.15, f"Approved! Writing {total_chapters} chapters...")
+        log.info(f"Continuation worker started. {total_chapters} chapters to write.")
+        
+        story_parts = []
+        chapter_summaries = []
+        
+        for chapter_num in range(1, total_chapters + 1):
+            if is_cancel_requested(job_id):
+                update_job_status(job_id, "error", 0, "Generation cancelled by user")
+                status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+                os.remove(status_file)
+                return
+            
+            chapter_progress = 0.1 + (chapter_num - 1) / total_chapters * 0.7
+            update_job_status(job_id, "running", chapter_progress, f"Phase 2: Writing Chapter {chapter_num}/{total_chapters}...")
+
+            running_summary = build_running_summary(chapter_summaries)
+            
+            if chapter_num == 1:
+                ch_prompt = f"""{base_prompt}
+{worldbook_context}{story_context}{voice_instruction}
+Based on this outline:
+{outline}
+Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above."""
+            else:
+                ch_prompt = f"""{base_prompt}
+{worldbook_context}{story_context}{voice_instruction}
+{running_summary}
+Continue the story logically from the summaries above. 
+Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above."""
+            ch_prompt += " End this chapter with [END]"
+            
+            update_job_status(job_id, "running", chapter_progress, f"Phase 2: Requesting Chapter {chapter_num}/{total_chapters} from AI...")
+            log.info(f"Requesting Chapter {chapter_num}/{total_chapters}")
+            response = stream_llm_with_retry(prompt=ch_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.8)
+            
+            chapter = ""
+            ch_tokens = 0
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        chapter += content
+                        ch_tokens += 1
+            
+            log.info(f"Chapter {chapter_num}/{total_chapters} received ({ch_tokens} tokens, {len(chapter)} chars)")
+            
+            # VALIDATE + AUTO-REGEN
+            is_valid, issues, cleaned_chapter = validate_chapter_voice_tags(chapter)
+            regen_attempts = 0
+            while not is_valid and regen_attempts < 2:
+                regen_attempts += 1
+                log.warning(f"Chapter {chapter_num} voice tag issues: {issues}. Regenerating (attempt {regen_attempts}/2)...")
+                update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}: fixing voice tags (attempt {regen_attempts})...")
+                
+                fix_prompt = f"""{base_prompt}
+{worldbook_context}{story_context}{voice_instruction}
+The previous version of Chapter {chapter_num} had formatting issues with voice tags. Rewrite it carefully ensuring ALL voice tags are properly opened and closed within the same paragraph.
+
+Previous chapter (for reference):
+{chapter}
+
+Write Chapter {chapter_num} again, fixing all voice tag issues. End with [END]"""
+                
+                response = stream_llm_with_retry(prompt=fix_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.7)
+                chapter = ""
+                ch_tokens = 0
+                for chunk in response:
+                    if chunk.choices and chunk.choices[0].delta:
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            chapter += content
+                            ch_tokens += 1
+                
+                is_valid, issues, cleaned_chapter = validate_chapter_voice_tags(chapter)
+                log.info(f"Chapter {chapter_num} regen attempt {regen_attempts}: valid={is_valid}, issues={issues}")
+            
+            chapter = cleaned_chapter
+            story_parts.append(chapter)
+
+            update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}/{total_chapters} written ({ch_tokens} tokens). Summarizing...")
+            log.info(f"Summarizing Chapter {chapter_num}/{total_chapters}...")
+            chapter_summary = generate_chapter_summary(chapter, chapter_num, job_id)
+            chapter_summaries.append(chapter_summary)
+            log.info(f"Chapter {chapter_num}/{total_chapters} summarized")
+
+            chapter_progress = 0.1 + chapter_num / total_chapters * 0.7
+            update_job_status(job_id, "running", chapter_progress, f"Chapter {chapter_num}/{total_chapters} Completed ({ch_tokens} tokens)")
+        
+        story = "\n\n".join(story_parts)
+        story = fix_voice_tags(story)
+
+        if not story.strip():
+            update_job_status(job_id, "error", 0, "Failed to generate story - empty response from AI")
+            return
+        
+        # TITLE
+        update_job_status(job_id, "running", 0.85, "Phase 3: Generating Title...")
+        if custom_title and custom_title.strip():
+            title = custom_title.strip()
+            update_job_status(job_id, "running", 0.9, f"Using custom title: {title}", title=title)
+        else:
+            try:
+                title_prompt = f"Based on the following story outline, create ONE compelling title:\n========\n{outline}\n========\nONLY OUTPUT THE TITLE, NOTHING ELSE!"
+                title_response = llm_client.chat.completions.create(
+                    model=TITLE_MODEL, messages=[{"role": "user", "content": title_prompt}],
+                    max_tokens=30, temperature=0.7
+                )
+                title = title_response.choices[0].message.content.strip()
+                title = re.sub(r'^[*_`#]*(?:Book\s+)?Title[*_`#]*\s*[:\-–]\s*', '', title, flags=re.IGNORECASE)
+                title = re.sub(r'[*`#]+', '', title)
+                title = title.replace('_', ' ')
+                title = title.strip('"\'""''')
+                title = ' '.join(title.split())
+                title = title[:50].strip()
+            except:
+                title = "Untitled-Story"
+            update_job_status(job_id, "running", 0.9, f"Generated Title: {title}", title=title)
+
+        # SAVE + TTS
+        update_job_status(job_id, "running", 0.9, "Saving files...", title=title)
+        log.info(f"Saving story files for '{title}'...")
+        filepath, story_dir = save_story(story, title, series_name)
+        log.info(f"Story saved: {filepath}")
+        tts_filepath = save_tts_story(story, title, story_dir)
+        log.info(f"TTS story saved: {tts_filepath}")
+        voices_used = extract_voices_used(story)
+        regen_params = {
+            "topic": topic, "genre": genre, "story_type": story_type,
+            "reference_story": str(reference_story) if reference_story else None,
+            "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
+            "features": features, "length_instruction": length_instruction,
+            "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
+            "custom_title": custom_title, "time_period": time_period
+        }
+        save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=params)
+        log.info(f"Metadata saved. Voices used: {voices_used}")
+
+        if chapter_summaries:
+            summaries_path = story_dir / f"{sanitize_title(title)}_chapter_summaries.json"
+            with open(summaries_path, 'w') as f:
+                json.dump(chapter_summaries, f, indent=2)
+            update_job_status(job_id, "running", 0.92, "Generating book summary from chapter summaries...")
+            log.info("Generating book summary...")
+            book_summary = generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id)
+            update_job_status(job_id, "running", 0.93, "Book summary generated!")
+        
+        if series_name:
+            add_story_to_series(series_name, title, story_type, reference_story, filepath,
+                            worldbook_path.name if worldbook_path else None)
+            if worldbook_path:
+                update_worldbook_series_link(worldbook_path, series_name)
+        
+        files = [str(filepath), str(story_dir / f"{sanitize_title(title)}.pdf"), str(tts_filepath)]
+
+        if want_tts:
+            audiobook_path = generate_tts_background(story, title, story_dir, job_id)
+            if audiobook_path:
+                files.append(str(audiobook_path))
+                cover_path = generate_cover_image(title, book_summary, story_dir, job_id)
+                if cover_path:
+                    embed_cover_in_mp3(str(audiobook_path), str(cover_path), title)
+                    files.append(str(cover_path))
+                    update_job_status(job_id, "running", 0.97, "Cover art embedded in audiobook!")
+        
+        # Clean up outline temp file
+        outline_path = Path(JOBS_DIR) / f"job_{job_id}_outline.txt"
+        if outline_path.exists():
+            outline_path.unlink()
+        
+        update_job_status(job_id, "completed", 1.0, "Generation Complete!", files, title)
+        log.info("Generation complete!")
+        
+    except Exception as e:
+        log.error(f"Continuation worker error: {e}", exc_info=True)
         update_job_status(job_id, "error", 0, str(e))
 
 def run_tts_worker(job_id, story_path):
@@ -2142,19 +2606,24 @@ def main():
             st.rerun()
 
     jobs = get_all_jobs()
-    running_jobs = [j for j in jobs if j['status'] == 'running']
+    active_jobs = [j for j in jobs if j['status'] in ['running', 'awaiting_approval']]
     
-    if running_jobs:
+    if active_jobs:
         st.sidebar.markdown("### ⚙️ Background Jobs")
-        for job in running_jobs:
+        for job in active_jobs:
             job_id = job.get('job_id', 'unknown')
             title = job.get('title', 'Working...')
             job_type = job.get('job_type', 'story')
+            status = job['status']
             
             with st.sidebar.container():
-                st.markdown(f"**{job_type.title()}:** {title}")
-                st.progress(job['progress'])
-                st.caption(job['message'][:80] + ('...' if len(job['message']) > 80 else ''))
+                if status == 'awaiting_approval':
+                    st.markdown(f"**⏸️ Awaiting Approval:** {title}")
+                    st.caption(f"📋 {job['message'][:100]}...")
+                else:
+                    st.markdown(f"**{job_type.title()}:** {title}")
+                    st.progress(job['progress'])
+                    st.caption(job['message'][:80] + ('...' if len(job['message']) > 80 else ''))
                 
                 if st.button("❌ Cancel", key=f"cancel_sidebar_{job_id}"):
                     request_cancel(job_id)
@@ -2171,10 +2640,8 @@ def main():
 
                 st.caption(f"Job ID: `{job_id}`")
                 st.divider()
-        
-        # REMOVED: time.sleep(2) and st.rerun() from here
 
-    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story", "TTS Tester"]
+    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story", "TTS Tester", "Timeline View"]
     choice = st.sidebar.selectbox("Menu", menu)
 
     if choice == "Generate New Story":
@@ -2189,6 +2656,8 @@ def main():
         series_manager_page()
     elif choice == "Worldbook Manager":
         worldbook_manager_page()
+    elif choice == "Timeline View":
+        timeline_view_page()
     elif choice == "Feature Manager":
         feature_manager_page()
     elif choice == "Clean Existing Story":
@@ -2196,8 +2665,8 @@ def main():
     elif choice == "TTS Tester":
         tts_tester_page()
 
-    # MOVED HERE: Auto-refresh at the very end, after everything renders
-    if running_jobs:
+    # Auto-refresh at the very end, after everything renders
+    if active_jobs:
         time.sleep(2)
         st.rerun()
 
@@ -2209,21 +2678,83 @@ def randomize_features():
 def generate_new_story_page():
     st.header("Generate New Story")
     
-    if 'current_job_id' in st.session_state:
-        job = get_job_status(st.session_state['current_job_id'])
+    # Check for current job in session state
+    current_job_id = st.session_state.get('current_job_id')
+    
+    # FALLBACK: If no current job in session (e.g., after re-login),
+    # scan for any running/awaiting story jobs and adopt the most recent one
+    if not current_job_id:
+        jobs = get_all_jobs()
+        active_story_jobs = [j for j in jobs 
+                             if j['status'] in ['running', 'awaiting_approval'] 
+                             and j.get('job_type') == 'story']
+        if active_story_jobs:
+            active_story_jobs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            current_job_id = active_story_jobs[0]['job_id']
+            st.session_state['current_job_id'] = current_job_id
+            log.info(f"Adopted active story job {current_job_id} after session reset")
+    
+    if current_job_id:
+        job = get_job_status(current_job_id)
         if job:
-            if job['status'] == 'running':
+            if job['status'] == 'awaiting_approval':
+                st.info("📋 **Outline generated! Please review the synopsis:**")
+                st.markdown(f"> {job['message']}")
+                
+                col_approve, col_regen = st.columns(2)
+                with col_approve:
+                    if st.button("✅ Approve & Continue", type="primary"):
+                        outline_path = Path(JOBS_DIR) / f"job_{current_job_id}_outline.txt"
+                        if outline_path.exists():
+                            with open(outline_path, 'r') as f:
+                                outline = f.read()
+                            
+                            params = job.get('params', {})
+                            new_job_id = str(int(time.time()))
+                            
+                            thread = threading.Thread(
+                                target=run_story_continuation_worker,
+                                args=(new_job_id, outline, params.get('topic'), params.get('genre'), 
+                                      params.get('story_type'), 
+                                      Path(params['reference_story']) if params.get('reference_story') else None,
+                                      params.get('series_name'), 
+                                      Path(params['worldbook_path']) if params.get('worldbook_path') else None,
+                                      params.get('features', []), params.get('length_instruction'), 
+                                      params.get('want_tts', True), params.get('debug_mode', False), 
+                                      params.get('quick_test', False), params.get('custom_title', ''),
+                                      params.get('time_period', ''))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            
+                            delete_job(current_job_id)
+                            st.session_state['current_job_id'] = new_job_id
+                            st.success("✅ Approved! Continuing generation...")
+                            time.sleep(2)
+                            st.rerun()
+                        else:
+                            st.error("Outline file not found. Please regenerate.")
+                
+                with col_regen:
+                    if st.button("🔄 Regenerate Outline"):
+                        delete_job(current_job_id)
+                        del st.session_state['current_job_id']
+                        st.rerun()
+                return
+            
+            elif job['status'] == 'running':
                 st.info(f"🔄 **Active Job:** {job['message']}")
                 st.progress(job['progress'])
                 
                 if st.button("❌ Cancel Generation", type="secondary"):
-                    request_cancel(st.session_state['current_job_id'])
+                    request_cancel(current_job_id)
                     st.warning("Cancellation requested. Job will stop at next checkpoint...")
                     time.sleep(2)
                     st.rerun()
                 
                 time.sleep(2)
                 st.rerun()
+            
             elif job['status'] == 'completed':
                 st.success(f"✅ **Last Job Complete!** {job['message']}")
                 if job.get('files'):
@@ -2241,10 +2772,11 @@ def generate_new_story_page():
                                 with open(p, 'rb') as f:
                                     st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg')
                 if st.button("Clear and Start New"):
-                    delete_job(st.session_state['current_job_id'])
+                    delete_job(current_job_id)
                     del st.session_state['current_job_id']
                     st.rerun()
                 return
+            
             elif job['status'] == 'error':
                 st.error(f"❌ **Last Job Failed:** {job['message']}")
                 col1, col2 = st.columns(2)
@@ -2260,27 +2792,31 @@ def generate_new_story_page():
                             target=run_generation_worker,
                             args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
                                   ref_story, params.get('series_name'), wb_path, params.get('features', []), 
-                                  params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False))
+                                  params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False), 
+                                  params.get('custom_title', ""), params.get('time_period', ""))
                         )
                         thread.daemon = True
                         thread.start()
                         
-                        delete_job(st.session_state['current_job_id'])
+                        delete_job(current_job_id)
                         st.session_state['current_job_id'] = new_job_id
                         st.rerun()
                 with col2:
                     if st.button("Clear Error"):
-                        delete_job(st.session_state['current_job_id'])
+                        delete_job(current_job_id)
                         del st.session_state['current_job_id']
                         st.rerun()
                 return
     
+    # No active job, show the generate form
     col1, col2 = st.columns(2)
     
     with col1:
         topic = st.text_input("Topic", placeholder="Leave blank for AI to decide")
+        # ... rest of form unchanged ...
         genre = st.text_input("Genre", placeholder="Leave blank for AI to decide")
         custom_title = st.text_input("Custom Title (optional)", placeholder="Leave blank for AI to generate")
+        time_period = st.text_input("Time Period (optional)", placeholder="e.g., 'Year 2029' or 'Summer 1994'")
         story_type = st.selectbox("Story Type", ["standalone", "sequel", "prequel"])
         
         reference_story = None
@@ -2368,7 +2904,7 @@ def generate_new_story_page():
         
         thread = threading.Thread(
             target=run_generation_worker,
-            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode, quick_test, custom_title)
+            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode, quick_test, custom_title, time_period)
         ) 
         thread.daemon = True
         thread.start()
@@ -2431,7 +2967,47 @@ def job_status_page():
                 elif job['status'] == 'error':
                     st.metric("Error", "Failed")
             
-            if job['status'] == 'running':
+            if job['status'] == 'awaiting_approval':
+                st.info("📋 **Outline generated! Review synopsis:**")
+                st.markdown(f"> {job['message']}")
+                
+                col_approve, col_regen = st.columns(2)
+                with col_approve:
+                    if st.button("✅ Approve & Continue", type="primary", key=f"approve_{job_id}"):
+                        outline_path = Path(JOBS_DIR) / f"job_{job_id}_outline.txt"
+                        if outline_path.exists():
+                            with open(outline_path, 'r') as f:
+                                outline = f.read()
+                            
+                            params = job.get('params', {})
+                            new_job_id = str(int(time.time()))
+                            
+                            thread = threading.Thread(
+                                target=run_story_continuation_worker,
+                                args=(new_job_id, outline, params.get('topic'), params.get('genre'), 
+                                      params.get('story_type'),
+                                      Path(params['reference_story']) if params.get('reference_story') else None,
+                                      params.get('series_name'), 
+                                      Path(params['worldbook_path']) if params.get('worldbook_path') else None,
+                                      params.get('features', []), params.get('length_instruction'), 
+                                      params.get('want_tts', True), params.get('debug_mode', False), 
+                                      params.get('quick_test', False), params.get('custom_title', ''),
+                                      params.get('time_period', ''))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            
+                            delete_job(job_id)
+                            st.success("✅ Approved! Continuing generation...")
+                            time.sleep(2)
+                            st.rerun()
+                
+                with col_regen:
+                    if st.button("🔄 Regenerate Outline", key=f"regen_{job_id}"):
+                        delete_job(job_id)
+                        st.rerun()
+            
+            elif job['status'] == 'running':
                 st.progress(job['progress'])
                 
                 if st.button("❌ Cancel This Job", key=f"cancel_{job_id}"):
@@ -2463,7 +3039,7 @@ def job_status_page():
             elif job['status'] == 'error':
                 st.error(f"❌ Error: {job['message']}")
                 
-                col_retry, col_clear = st.columns(2)
+                col_retry, col_regen, col_clear = st.columns(3)
                 
                 with col_retry:
                     if st.button(f"🔄 Retry Job", key=f"retry_{job_id}"):
@@ -2480,7 +3056,7 @@ def job_status_page():
                                       ref_story, params.get('series_name'), wb_path, params.get('features', []), 
                                       params.get('length_instruction'), params.get('want_tts', True), 
                                       params.get('debug_mode', False), params.get('quick_test', False), 
-                                      params.get('custom_title', "")) # <--- Added custom_title here
+                                      params.get('custom_title', ""), params.get('time_period', ""))
                             )
                             thread.daemon = True
                             thread.start()
@@ -2511,16 +3087,57 @@ def job_status_page():
                         time.sleep(2)
                         st.rerun()
                 
+                with col_regen:
+                    if st.button(f"🔄 Regen Fresh", key=f"regen_fresh_{job_id}"):
+                        params = job.get('params', {})
+                        new_job_id = str(int(time.time()))
+                        
+                        if job_type == 'story':
+                            ref_story = Path(params['reference_story']) if params.get('reference_story') else None
+                            wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
+                            
+                            thread = threading.Thread(
+                                target=run_generation_worker,
+                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
+                                      ref_story, params.get('series_name'), wb_path, params.get('features', []), 
+                                      params.get('length_instruction'), params.get('want_tts', True), 
+                                      params.get('debug_mode', False), params.get('quick_test', False), 
+                                      params.get('custom_title', ""), params.get('time_period', ""))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_job_id'] = new_job_id
+                        
+                        delete_job(job_id)
+                        st.success(f"✅ Fresh regeneration started as {new_job_id}")
+                        time.sleep(2)
+                        st.rerun()
+                
                 with col_clear:
                     if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
                         delete_job(job_id)
                         st.rerun()
+                return
+
 
 def generate_tts_existing_page():
     st.header("Generate TTS for Existing Story")
     
-    if 'current_tts_job_id' in st.session_state:
-        job = get_job_status(st.session_state['current_tts_job_id'])
+    current_tts_job_id = st.session_state.get('current_tts_job_id')
+    
+    # FALLBACK: scan for active TTS jobs
+    if not current_tts_job_id:
+        jobs = get_all_jobs()
+        active_tts_jobs = [j for j in jobs 
+                           if j['status'] in ['running'] 
+                           and j.get('job_type') == 'tts']
+        if active_tts_jobs:
+            active_tts_jobs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            current_tts_job_id = active_tts_jobs[0]['job_id']
+            st.session_state['current_tts_job_id'] = current_tts_job_id
+    
+    if current_tts_job_id:
+        job = get_job_status(current_tts_job_id)
         if job:
             if job['status'] == 'running':
                 st.info(f"🔄 **Active Job:** {job['message']}")
@@ -2602,7 +3219,63 @@ def story_library_page():
     st.text_area("Content", story_content, height=500)
 
     st.divider()
+    # Regen section
+    st.subheader("🔄 Regenerate Story")
+    st.markdown("Regenerate this story with the exact same settings used originally. You'll get a new outline to approve before it writes the full story.")
     
+    meta_path = selected_file.parent / f"{selected_file.stem}_metadata.json"
+    has_regen_params = False
+    regen_params = None
+    
+    if meta_path.exists():
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+            regen_params = meta.get("generation_params")
+            has_regen_params = regen_params is not None
+    
+    if has_regen_params:
+        # Show what settings will be used
+        with st.expander("View original settings"):
+            st.write(f"**Topic:** {regen_params.get('topic', 'AI decided')}")
+            st.write(f"**Genre:** {regen_params.get('genre', 'AI decided')}")
+            st.write(f"**Story Type:** {regen_params.get('story_type', 'standalone')}")
+            st.write(f"**Features:** {', '.join(regen_params.get('features', [])) or 'None'}")
+            st.write(f"**Length:** {regen_params.get('length_instruction', 'AI decided')}")
+            st.write(f"**Worldbook:** {regen_params.get('worldbook_path', 'None')}")
+            st.write(f"**Time Period:** {regen_params.get('time_period', 'None')}")
+            st.write(f"**Custom Title:** {regen_params.get('custom_title', 'None')}")
+            st.write(f"**TTS:** {'Yes' if regen_params.get('want_tts') else 'No'}")
+        
+        col_regen1, col_regen2 = st.columns([1, 3])
+        with col_regen1:
+            confirm_regen = st.checkbox("I understand this creates a new story", key="confirm_regen")
+        with col_regen2:
+            st.write("")
+            if st.button("🔄 Regenerate with Same Settings", type="primary", disabled=not confirm_regen):
+                job_id = str(int(time.time()))
+                
+                # Extract params and convert paths back
+                ref_story = Path(regen_params['reference_story']) if regen_params.get('reference_story') else None
+                wb_path = Path(regen_params['worldbook_path']) if regen_params.get('worldbook_path') else None
+                
+                thread = threading.Thread(
+                    target=run_generation_worker,
+                    args=(job_id, regen_params.get('topic'), regen_params.get('genre'), 
+                          regen_params.get('story_type'), ref_story, regen_params.get('series_name'), 
+                          wb_path, regen_params.get('features', []), regen_params.get('length_instruction'), 
+                          regen_params.get('want_tts', True), regen_params.get('debug_mode', False), 
+                          regen_params.get('quick_test', False), regen_params.get('custom_title', ''),
+                          regen_params.get('time_period', ''))
+                )
+                thread.daemon = True
+                thread.start()
+                
+                st.session_state['current_job_id'] = job_id
+                st.success(f"✅ Regeneration started with original settings! Job ID: {job_id}")
+                time.sleep(2)
+                st.rerun()
+    else:
+        st.info("This story was generated before the regen feature was added. No original settings found.")
     # Delete section
     st.subheader("🗑️ Delete Story")
     st.warning("This will permanently delete the story folder, audiobook, PDF, cover art, and all associated files.")
@@ -2650,6 +3323,84 @@ def story_library_page():
         
         with open(audiobook_path, "rb") as f:
             st.download_button("Download Audiobook", f, file_name=f"{selected_file.stem}_audiobook.mp3", mime="audio/mpeg")
+
+def timeline_view_page():
+    st.header("📅 Story Timeline")
+    st.markdown("Stories organized by their canonical time period. Stories without a time period are shown at the end.")
+    
+    all_series = get_all_series()
+    all_stories = []
+    
+    # Collect all stories with their time periods
+    for series in all_series:
+        for story_meta in series.get("stories", []):
+            story_path = Path(SERIES_DIR) / series["name"] / story_meta["path"]
+            meta_path = story_path.parent / f"{story_path.stem}_metadata.json"
+            
+            time_period = None
+            if meta_path.exists():
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                    time_period = meta.get("time_period")
+            
+            all_stories.append({
+                "series": series["name"],
+                "title": story_meta["title"],
+                "order": story_meta["order"],
+                "type": story_meta["type"],
+                "time_period": time_period,
+                "has_period": time_period is not None
+            })
+    
+    # Also collect standalone stories
+    for story_file in get_all_stories():
+        meta_path = story_file.parent / f"{story_file.stem}_metadata.json"
+        time_period = None
+        if meta_path.exists():
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+                time_period = meta.get("time_period")
+        
+        # Skip if already in a series
+        try:
+            story_file.relative_to(Path(SERIES_DIR))
+            continue  # It's in a series, already collected
+        except ValueError:
+            all_stories.append({
+                "series": "Standalone",
+                "title": story_file.stem,
+                "order": 0,
+                "type": "standalone",
+                "time_period": time_period,
+                "has_period": time_period is not None
+            })
+    
+    # Sort: stories with time periods first, then without
+    with_period = [s for s in all_stories if s["has_period"]]
+    without_period = [s for s in all_stories if not s["has_period"]]
+    
+    # Try to sort with_period chronologically (rough sort by string)
+    with_period.sort(key=lambda x: (x["series"], x["time_period"]))
+    
+    # Display
+    if not all_stories:
+        st.info("No stories found. Generate one first!")
+        return
+    
+    st.subheader(f"📊 {len(with_period)} stories with time periods, {len(without_period)} without")
+    
+    if with_period:
+        st.markdown("### 🕐 Chronological Order")
+        for story in with_period:
+            type_icon = {"prequel": "⏮️", "sequel": "⏭️", "standalone": "📖"}.get(story["type"], "📖")
+            period_str = story["time_period"] if story["has_period"] else "Unknown"
+            st.write(f"{type_icon} **{story['title']}** — {period_str} ({story['series']})")
+    
+    if without_period:
+        st.markdown("### ❓ No Time Period Set")
+        for story in without_period:
+            type_icon = {"prequel": "⏮️", "sequel": "⏭️", "standalone": "📖"}.get(story["type"], "📖")
+            st.write(f"{type_icon} **{story['title']}** ({story['series']})")
 
 def series_manager_page():
     st.header("📚 Series Manager")
@@ -3261,7 +4012,32 @@ def clean_existing_story_page():
                         st.success(f"✅ Retrying job as {new_job_id}")
                         time.sleep(2)
                         st.rerun()
-                
+                with col_regen:
+                    if st.button(f"🔄 Regen Fresh", key=f"regen_fresh_{job_id}"):
+                        params = job.get('params', {})
+                        new_job_id = str(int(time.time()))
+                        
+                        if job_type == 'story':
+                            ref_story = Path(params['reference_story']) if params.get('reference_story') else None
+                            wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
+                            
+                            thread = threading.Thread(
+                                target=run_generation_worker,
+                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
+                                      ref_story, params.get('series_name'), wb_path, params.get('features', []), 
+                                      params.get('length_instruction'), params.get('want_tts', True), 
+                                      params.get('debug_mode', False), params.get('quick_test', False), 
+                                      params.get('custom_title', ""), params.get('time_period', ""))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_job_id'] = new_job_id
+                        
+                        delete_job(job_id)
+                        st.success(f"✅ Fresh regeneration started as {new_job_id}")
+                        time.sleep(2)
+                        st.rerun
+
                 with col2:
                     if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
                         delete_job(job_id)
