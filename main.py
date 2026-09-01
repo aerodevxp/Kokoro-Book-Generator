@@ -2228,6 +2228,24 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
 def run_story_continuation_worker(job_id, outline, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test, custom_title, time_period):
     """Continue story generation after outline approval."""
     try:
+        def check_cancel():
+            if is_cancel_requested(job_id):
+                update_job_status(job_id, "error", 0, "Generation cancelled by user")
+                status_file = Path(JOBS_DIR) / f"job_{job_id}_status.json"
+                os.remove(status_file)
+                st.rerun()
+                return True
+            return False
+        params = {
+            "topic": topic, "genre": genre, "story_type": story_type,
+            "reference_story": str(reference_story) if reference_story else None,
+            "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
+            "features": features, "length_instruction": length_instruction,
+            "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
+            "custom_title": custom_title, "time_period": time_period,
+            "outline": outline  # Save outline so retry can skip regenerating it
+        }
+        
         base_prompt = read_base_prompt()
         
         character_voices = {}
@@ -2244,7 +2262,7 @@ def run_story_continuation_worker(job_id, outline, topic, genre, story_type, ref
         chapter_matches = re.findall(r'(?:Chapter|chapter)\s+(\d+)', outline, re.IGNORECASE)
         total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
         
-        update_job_status(job_id, "running", 0.15, f"Approved! Writing {total_chapters} chapters...")
+        update_job_status(job_id, "running", 0.15, f"Approved! Writing {total_chapters} chapters...", params=params)
         log.info(f"Continuation worker started. {total_chapters} chapters to write.")
         
         story_parts = []
@@ -2433,10 +2451,12 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                     files.append(str(cover_path))
                     update_job_status(job_id, "running", 0.97, "Cover art embedded in audiobook!")
         
-        # Clean up outline temp file
         outline_path = Path(JOBS_DIR) / f"job_{job_id}_outline.txt"
         if outline_path.exists():
             outline_path.unlink()
+        # Also clean up orphaned outline files from the original approval job
+        for f in Path(JOBS_DIR).glob("job_*_outline.txt"):
+            f.unlink()
         
         update_job_status(job_id, "completed", 1.0, "Generation Complete!", files, title)
         log.info("Generation complete!")
@@ -3578,14 +3598,31 @@ def job_status_page():
                             ref_story = Path(params['reference_story']) if params.get('reference_story') else None
                             wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
                             
-                            thread = threading.Thread(
-                                target=run_generation_worker,
-                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
-                                      ref_story, params.get('series_name'), wb_path, params.get('features', []), 
-                                      params.get('length_instruction'), params.get('want_tts', True), 
-                                      params.get('debug_mode', False), params.get('quick_test', False), 
-                                      params.get('custom_title', ""), params.get('time_period', ""))
-                            )
+                            # Check if we have a saved outline (continuation job)
+                            saved_outline = params.get('outline')
+                            
+                            if saved_outline:
+                                # Retry continuation directly, skip outline generation
+                                thread = threading.Thread(
+                                    target=run_story_continuation_worker,
+                                    args=(new_job_id, saved_outline, params.get('topic'), params.get('genre'), 
+                                        params.get('story_type'),
+                                        ref_story, params.get('series_name'), wb_path,
+                                        params.get('features', []), params.get('length_instruction'), 
+                                        params.get('want_tts', True), params.get('debug_mode', False), 
+                                        params.get('quick_test', False), params.get('custom_title', ''),
+                                        params.get('time_period', ''))
+                                )
+                            else:
+                                # No outline saved, start from scratch
+                                thread = threading.Thread(
+                                    target=run_generation_worker,
+                                    args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
+                                        ref_story, params.get('series_name'), wb_path, params.get('features', []), 
+                                        params.get('length_instruction'), params.get('want_tts', True), 
+                                        params.get('debug_mode', False), params.get('quick_test', False), 
+                                        params.get('custom_title', ""), params.get('time_period', ""))
+                                )
                             thread.daemon = True
                             thread.start()
                             st.session_state['current_job_id'] = new_job_id
@@ -3614,7 +3651,6 @@ def job_status_page():
                         st.success(f"✅ Retrying job as {new_job_id}")
                         time.sleep(2)
                         st.rerun()
-                
                 with col_regen:
                     if st.button(f"🔄 Regen Fresh", key=f"regen_fresh_{job_id}"):
                         params = job.get('params', {})
