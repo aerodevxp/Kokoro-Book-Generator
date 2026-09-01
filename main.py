@@ -246,6 +246,198 @@ def embed_cover_in_mp3(mp3_path, cover_path, title):
     audio.add(TPE1(encoding=3, text=STORY_MODEL))
     audio.save(mp3_path)
 
+def embed_cover_in_m4b(m4b_path, cover_path, title):
+    """Embed cover art and metadata into M4B file"""
+    temp_path = str(m4b_path) + ".tmp"
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', str(m4b_path),
+        '-i', str(cover_path),
+        '-map', '0:a',
+        '-map', '1:v',
+        '-c', 'copy',
+        '-c:v:1', 'mjpeg',
+        '-disposition:v:0', 'attached_pic',
+        '-metadata', f'title={title}',
+        '-metadata', f'artist={STORY_MODEL}',
+        '-f', 'mp4',
+        temp_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            os.replace(temp_path, str(m4b_path))
+            log.info(f"Cover art embedded in M4B: {m4b_path}")
+        else:
+            log.warning(f"M4B cover embedding failed: {result.stderr[:300]}")
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    except Exception as e:
+        log.warning(f"M4B cover embedding error: {e}")
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+def convert_existing_to_m4b(story_path, job_id=None):
+    """Convert an existing MP3 audiobook to M4B with chapter markers"""
+    story_dir = story_path.parent
+    stem = story_path.stem
+    mp3_path = story_dir / f"{stem}_audiobook.mp3"
+    
+    if not mp3_path.exists():
+        return False, "No audiobook MP3 found for this story"
+    
+    # Get chapter count from summaries
+    summaries_path = story_dir / f"{sanitize_title(stem)}_chapter_summaries.json"
+    chapter_count = 0
+    if summaries_path.exists():
+        with open(summaries_path, 'r') as f:
+            chapter_summaries = json.load(f)
+            chapter_count = len(chapter_summaries)
+    
+    if job_id:
+        update_job_status(job_id, "running", 0.1, f"Probing audio duration ({chapter_count} chapters detected)...")
+    
+    # Get total duration
+    probe = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(mp3_path)],
+        capture_output=True, text=True, timeout=30
+    )
+    if probe.returncode != 0:
+        return False, "Failed to probe MP3 duration"
+    
+    total_duration_ms = int(float(probe.stdout.strip()) * 1000)
+    
+    if chapter_count == 0:
+        # No chapter info, just convert without chapters
+        chapter_count = 1
+        chapter_timestamps = [(0, total_duration_ms)]
+    else:
+        # Try silence detection first
+        if job_id:
+            update_job_status(job_id, "running", 0.2, "Detecting silence for chapter breaks...")
+        
+        sil_detect = subprocess.run(
+            ['ffmpeg', '-i', str(mp3_path), '-af',
+             'silencedetect=noise=-40dB:d=0.6', '-f', 'null', '-'],
+            capture_output=True, text=True, timeout=300
+        )
+        
+        # Parse silence start/end times from stderr
+        silence_starts = []
+        silence_ends = []
+        for line in sil_detect.stderr.split('\n'):
+            if 'silence_start:' in line:
+                try:
+                    val = float(line.split('silence_start:')[1].strip().split()[0])
+                    silence_starts.append(val)
+                except:
+                    pass
+            elif 'silence_end:' in line:
+                try:
+                    val = float(line.split('silence_end:')[1].strip().split()[0])
+                    silence_ends.append(val)
+                except:
+                    pass
+        
+        # Find silences that are >= 0.7s (longer pauses between paragraphs/chapters)
+        long_silences = []
+        for i, (start, end) in enumerate(zip(silence_starts, silence_ends)):
+            duration = end - start
+            if duration >= 0.7:
+                # Use the midpoint of the silence as the chapter boundary
+                midpoint = int(((start + end) / 2) * 1000)
+                long_silences.append(midpoint)
+        
+        # If we found enough long silences, use them
+        # We need chapter_count - 1 boundaries
+        needed_boundaries = chapter_count - 1
+        
+        if len(long_silences) >= needed_boundaries:
+            # Pick the longest silences as chapter breaks
+            # Calculate silence durations
+            silence_durations = []
+            for i, (start, end) in enumerate(zip(silence_starts, silence_ends)):
+                if (end - start) >= 0.7:
+                    midpoint = int(((start + end) / 2) * 1000)
+                    silence_durations.append((end - start, midpoint))
+            
+            # Sort by duration descending, take top N, then re-sort by position
+            silence_durations.sort(key=lambda x: x[0], reverse=True)
+            top_boundaries = sorted([s[1] for s in silence_durations[:needed_boundaries]])
+            
+            chapter_timestamps = []
+            prev_start = 0
+            for boundary in top_boundaries:
+                chapter_timestamps.append((prev_start, boundary))
+                prev_start = boundary
+            chapter_timestamps.append((prev_start, total_duration_ms))
+            
+            if job_id:
+                update_job_status(job_id, "running", 0.4, f"Found {len(top_boundaries)} chapter breaks via silence detection")
+        else:
+            # Fall back to even splitting
+            if job_id:
+                update_job_status(job_id, "running", 0.3, "Not enough silence detected, using even split...")
+            
+            chapter_duration = total_duration_ms // chapter_count
+            chapter_timestamps = []
+            for i in range(chapter_count):
+                start = i * chapter_duration
+                end = (i + 1) * chapter_duration if i < chapter_count - 1 else total_duration_ms
+                chapter_timestamps.append((start, end))
+    
+    if job_id:
+        update_job_status(job_id, "running", 0.5, f"Writing chapter metadata for {len(chapter_timestamps)} chapters...")
+    
+    # Generate FFMETADATA
+    meta_file = story_dir / "chapters.ffmeta"
+    with open(meta_file, 'w') as f:
+        f.write(";FFMETADATA1\n")
+        for i, (start, end) in enumerate(chapter_timestamps):
+            f.write(f"[CHAPTER]\n")
+            f.write(f"TIMEBASE=1/1000\n")
+            f.write(f"START={int(start)}\n")
+            f.write(f"END={int(end)}\n")
+            f.write(f"title=Chapter {i+1}\n")
+    
+    # Convert to M4B
+    m4b_path = story_dir / f"{sanitize_title(stem)}_audiobook.m4b"
+    
+    if job_id:
+        update_job_status(job_id, "running", 0.6, "Converting to M4B with ffmpeg...")
+    
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', str(mp3_path),
+        '-i', str(meta_file),
+        '-map_metadata', '1',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-ar', '44100',
+        '-f', 'mp4',
+        str(m4b_path)
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            return False, f"FFmpeg failed: {result.stderr[:300]}"
+    except Exception as e:
+        return False, f"FFmpeg error: {e}"
+    
+    try: meta_file.unlink()
+    except: pass
+    
+    # Embed cover if exists
+    cover_path = story_dir / f"{sanitize_title(stem)}_cover.png"
+    if cover_path.exists():
+        embed_cover_in_m4b(str(m4b_path), str(cover_path), stem)
+    
+    if job_id:
+        update_job_status(job_id, "completed", 1.0, "M4B conversion complete!", [str(m4b_path)], stem, job_type="m4b_convert")
+    
+    return True, str(m4b_path)
+
 def build_voice_instruction(character_voices=None, available_sfx=None):
     sfx_list = available_sfx if available_sfx else []
     sfx_str = ", ".join(sfx_list) if sfx_list else "None available"
@@ -2010,12 +2202,18 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
 
         if want_tts:
             if check_cancel(): return
-            audiobook_path = generate_tts_background(story, title, story_dir, job_id)
+            result = generate_tts_background(story, title, story_dir, job_id)
+            audiobook_path = result[0] if result else None
+            m4b_path = result[1] if result else None
             if audiobook_path:
                 files.append(str(audiobook_path))
-                cover_path = generate_cover_image(title, book_summary if not debug_mode else "", story_dir, job_id)
+                if m4b_path:
+                    files.append(str(m4b_path))
+                cover_path = generate_cover_image(title, synopsis if not debug_mode else "", story_dir, job_id)
                 if cover_path:
                     embed_cover_in_mp3(str(audiobook_path), str(cover_path), title)
+                    if m4b_path:
+                        embed_cover_in_m4b(str(m4b_path), str(cover_path), title)
                     files.append(str(cover_path))
                     update_job_status(job_id, "running", 0.97, "Cover art embedded in audiobook!")
         
@@ -2219,12 +2417,19 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
         files = [str(filepath), str(story_dir / f"{sanitize_title(title)}.pdf"), str(tts_filepath)]
 
         if want_tts:
-            audiobook_path = generate_tts_background(story, title, story_dir, job_id)
+            if check_cancel(): return
+            result = generate_tts_background(story, title, story_dir, job_id)
+            audiobook_path = result[0] if result else None
+            m4b_path = result[1] if result else None
             if audiobook_path:
                 files.append(str(audiobook_path))
-                cover_path = generate_cover_image(title, book_summary, story_dir, job_id)
+                if m4b_path:
+                    files.append(str(m4b_path))
+                cover_path = generate_cover_image(title, synopsis if not debug_mode else "", story_dir, job_id)
                 if cover_path:
                     embed_cover_in_mp3(str(audiobook_path), str(cover_path), title)
+                    if m4b_path:
+                        embed_cover_in_m4b(str(m4b_path), str(cover_path), title)
                     files.append(str(cover_path))
                     update_job_status(job_id, "running", 0.97, "Cover art embedded in audiobook!")
         
@@ -2255,15 +2460,31 @@ def run_tts_worker(job_id, story_path):
                 story_content = f.read()
                 story_content = fix_voice_tags(story_content)
         
-        audiobook_path = generate_tts_background(story_content, story_path.stem, story_path.parent, job_id)
+        result = generate_tts_background(story_content, story_path.stem, story_path.parent, job_id)
+        audiobook_path = result[0] if result else None
+        m4b_path = result[1] if result else None
         
         if audiobook_path:
-            update_job_status(job_id, "completed", 1.0, "TTS Generation Complete!", [str(audiobook_path)], story_path.stem, job_type="tts")
+            files = [str(audiobook_path)]
+            if m4b_path:
+                files.append(str(m4b_path))
+            update_job_status(job_id, "completed", 1.0, "TTS Generation Complete!", files, story_path.stem, job_type="tts")
         else:
             update_job_status(job_id, "error", 0, "TTS generation failed", job_type="tts")
     except Exception as e:
         log.warning(e)
         update_job_status(job_id, "error", 0, str(e), job_type="tts")
+
+def run_m4b_convert_worker(job_id, story_path):
+    try:
+        params = {"story_path": str(story_path)}
+        update_job_status(job_id, "running", 0, "Starting M4B conversion...", job_type="m4b_convert", params=params)
+        success, result = convert_existing_to_m4b(story_path, job_id)
+        if not success:
+            update_job_status(job_id, "error", 0, result, job_type="m4b_convert")
+    except Exception as e:
+        log.warning(e)
+        update_job_status(job_id, "error", 0, str(e), job_type="m4b_convert")
 
 def run_clean_worker(job_id, story_path):
     try:
@@ -2430,12 +2651,17 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             paragraphs = [p.strip() for p in kokoro_text.split('\n\n') if p.strip()]
             for para in paragraphs:
                 if len(para) > 3:
-                    # Clean special characters that break Kokoro
                     para = clean_text_for_tts(para)
-                    # Split long paragraphs into chunks Kokoro can handle
                     for chunk in split_long_text(para, max_chars=300):
                         if len(chunk) > 3:
-                            timeline.append({'type': 'tts', 'text': chunk})
+                            # Detect [END] marker for chapter boundaries
+                            if '[END]' in chunk:
+                                chunk = chunk.replace('[END]', '').strip()
+                                if chunk:
+                                    timeline.append({'type': 'tts', 'text': chunk})
+                                timeline.append({'type': 'chapter_end'})
+                            else:
+                                timeline.append({'type': 'tts', 'text': chunk})
     
     if not timeline:
         update_job_status(job_id, "error", 0, "No text content found for TTS")
@@ -2649,9 +2875,16 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             elif item['type'] == 'bgsfx_stop':
                 current_bgsfx = None
                 log.warning(f"[INFO] BGSFX stopped")
+            
+            elif item['type'] == 'chapter_end':
+                chapter_timestamps.append((current_chapter_start, bgsfx_offset))
+                current_chapter_start = bgsfx_offset
                 
             if j < len(chunk_items) - 1:
-                pause_dur = pause_tts if item['type'] == 'tts' else pause_sfx
+                if item['type'] == 'chapter_end':
+                    pause_dur = AudioSegment.silent(duration=1500, frame_rate=44100)
+                else:
+                    pause_dur = pause_tts if item['type'] == 'tts' else pause_sfx
                 
                 if current_bgsfx:
                     bgsfx_len = len(current_bgsfx)
@@ -2744,15 +2977,59 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     if total_errors > 0:
         update_job_status(job_id, "running", 0.99, 
                          f"Audiobook exported with {total_errors} errors (skipped bad segments)")
-    
+
+    # Generate M4B with chapter markers
+    m4b_path = None
+    if chapter_timestamps:
+        update_job_status(job_id, "running", 0.99, f"Generating M4B with {len(chapter_timestamps)} chapters...")
+        log.info(f"Generating M4B with {len(chapter_timestamps)} chapters...")
+        
+        meta_file = story_dir / "chapters.ffmeta"
+        with open(meta_file, 'w') as f:
+            f.write(";FFMETADATA1\n")
+            for i, (start, end) in enumerate(chapter_timestamps):
+                f.write(f"[CHAPTER]\n")
+                f.write(f"TIMEBASE=1/1000\n")
+                f.write(f"START={int(start)}\n")
+                f.write(f"END={int(end)}\n")
+                f.write(f"title=Chapter {i+1}\n")
+        
+        m4b_path = story_dir / f"{safe_title}_audiobook.m4b"
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(audiobook_path),
+            '-i', str(meta_file),
+            '-map_metadata', '1',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-ar', '44100',
+            '-f', 'mp4',
+            str(m4b_path)
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode == 0:
+                log.info(f"M4B generated: {m4b_path}")
+            else:
+                log.error(f"M4B generation failed: {result.stderr[:500]}")
+                m4b_path = None
+        except Exception as e:
+            log.error(f"M4B generation error: {e}")
+            m4b_path = None
+        
+        try: meta_file.unlink()
+        except: pass
+    else:
+        log.info("No chapter markers found, skipping M4B generation")
+
     log.warning("[INFO] Audiobook generation complete!")
-    return audiobook_path
+    return audiobook_path, m4b_path
 
 def generate_cover_image(title, story_summary, story_dir, job_id=None):
     if job_id:
         update_job_status(job_id, "running", 0.95, "Generating cover art...")
     
-    prompt = f"Book cover art for a story titled '{title}'. Style: atmospheric, cinematic, no text. Story summary: {story_summary[:300]}"
+    prompt = f"Book cover art for a story titled '{title}'. Style: atmospheric, cinematic, poster. Story summary: {story_summary[:300]}"
     
     try:
         response = requests.post(
@@ -2890,7 +3167,7 @@ def main():
                 st.caption(f"Job ID: `{job_id}`")
                 st.divider()
 
-    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story", "TTS Tester", "Timeline View"]
+    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story", "TTS Tester", "Timeline View", "Convert to M4B"]
     choice = st.sidebar.selectbox("Menu", menu)
 
     if choice == "Generate New Story":
@@ -2913,6 +3190,8 @@ def main():
         clean_existing_story_page()
     elif choice == "TTS Tester":
         tts_tester_page()
+    elif choice == "Convert to M4B":
+        convert_m4b_page()
 
     # Auto-refresh at the very end, after everything renders
     if active_jobs:
@@ -3448,6 +3727,110 @@ def run_summary_worker(job_id, story_path):
     except Exception as e:
         log.warning(e)
         update_job_status(job_id, "error", 0, str(e), job_type="summary")
+
+def convert_m4b_page():
+    st.header("🔄 Convert MP3 to M4B")
+    st.markdown("Convert existing audiobook MP3s to M4B format with chapter markers for Audiobookshelf.")
+    
+    current_m4b_job_id = st.session_state.get('current_m4b_job_id')
+    
+    if not current_m4b_job_id:
+        jobs = get_all_jobs()
+        active_m4b_jobs = [j for j in jobs 
+                           if j['status'] in ['running'] 
+                           and j.get('job_type') == 'm4b_convert']
+        if active_m4b_jobs:
+            active_m4b_jobs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            current_m4b_job_id = active_m4b_jobs[0]['job_id']
+            st.session_state['current_m4b_job_id'] = current_m4b_job_id
+    
+    if current_m4b_job_id:
+        job = get_job_status(current_m4b_job_id)
+        if job:
+            if job['status'] == 'running':
+                st.info(f"🔄 **Converting:** {job['message']}")
+                st.progress(job['progress'])
+                time.sleep(2)
+                st.rerun()
+            elif job['status'] == 'completed':
+                st.success(f"✅ **Conversion Complete!** {job['message']}")
+                if job.get('files'):
+                    for file_path in job['files']:
+                        p = Path(file_path)
+                        if p.exists() and p.suffix == '.m4b':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mp4')
+                if st.button("Clear and Start New"):
+                    delete_job(st.session_state['current_m4b_job_id'])
+                    del st.session_state['current_m4b_job_id']
+                    st.rerun()
+                return
+            elif job['status'] == 'error':
+                st.error(f"❌ **Conversion Failed:** {job['message']}")
+                if st.button("Clear Error"):
+                    delete_job(st.session_state['current_m4b_job_id'])
+                    del st.session_state['current_m4b_job_id']
+                    st.rerun()
+                return
+    
+    stories = get_all_stories()
+    if not stories:
+        st.warning("No stories found.")
+        return
+    
+    # Filter to stories that have audiobook MP3s
+    stories_with_audio = []
+    for s in stories:
+        mp3_path = s.parent / f"{s.stem}_audiobook.mp3"
+        if mp3_path.exists():
+            stories_with_audio.append(s)
+    
+    if not stories_with_audio:
+        st.info("No stories with audiobooks found. Generate TTS first.")
+        return
+    
+    story_opts = [str(s.relative_to(Path(OUTPUT_DIR).parent)) for s in stories_with_audio]
+    selected = st.selectbox("Select Story", story_opts)
+    
+    selected_file = next(s for s in stories_with_audio if str(s.relative_to(Path(OUTPUT_DIR).parent)) == selected)
+    
+    # Show info about the story
+    summaries_path = selected_file.parent / f"{sanitize_title(selected_file.stem)}_chapter_summaries.json"
+    chapter_count = 0
+    if summaries_path.exists():
+        with open(summaries_path, 'r') as f:
+            chapter_count = len(json.load(f))
+    
+    mp3_path = selected_file.parent / f"{selected_file.stem}_audiobook.mp3"
+    if mp3_path.exists():
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', str(mp3_path)],
+            capture_output=True, text=True, timeout=10
+        )
+        duration = float(probe.stdout.strip()) if probe.returncode == 0 else 0
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("MP3 Size", f"{mp3_path.stat().st_size / 1024 / 1024:.1f} MB")
+        col2.metric("Duration", f"{duration / 60:.1f} min")
+        col3.metric("Chapters", chapter_count if chapter_count else "Unknown")
+    
+    m4b_path = selected_file.parent / f"{sanitize_title(selected_file.stem)}_audiobook.m4b"
+    if m4b_path.exists():
+        st.info(f"M4B already exists: {m4b_path.name} ({m4b_path.stat().st_size / 1024 / 1024:.1f} MB)")
+    
+    if st.button("🔄 Convert to M4B", type="primary"):
+        job_id = f"m4b_{int(time.time())}"
+        thread = threading.Thread(
+            target=run_m4b_convert_worker,
+            args=(job_id, selected_file)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        st.session_state['current_m4b_job_id'] = job_id
+        st.success(f"✅ M4B conversion started! Job ID: {job_id}")
+        st.rerun()
 
 def story_library_page():
     st.header("📚 Story Library")
@@ -4072,6 +4455,10 @@ def tts_tester_page():
             combined = AudioSegment.empty()
             current_bgsfx = None
             bgsfx_offset = 0
+
+            # Chapter tracking for M4B
+            chapter_timestamps = []
+            current_chapter_start = 0
             
             for j, item in enumerate(audio_items):
                 if item['type'] == 'tts':
