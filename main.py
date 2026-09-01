@@ -436,6 +436,8 @@ def convert_existing_to_m4b(story_path, job_id=None):
     if job_id:
         update_job_status(job_id, "completed", 1.0, "M4B conversion complete!", [str(m4b_path)], stem, job_type="m4b_convert")
     
+    mp3_path.unlink()
+    
     return True, str(m4b_path)
 
 def build_voice_instruction(character_voices=None, available_sfx=None):
@@ -2804,7 +2806,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     
     current_bgsfx = None
     bgsfx_offset = 0
-    
+    # Chapter tracking for M4B
+    chapter_timestamps = []
+    current_chapter_start = 0
+
     for i in range(0, len(audio_items), chunk_size):
         chunk_items = audio_items[i:i+chunk_size]
         chunk_audio = AudioSegment.silent(duration=100, frame_rate=44100)
@@ -3433,7 +3438,7 @@ def generate_new_story_page():
         
         length_opts = {
             "AI decides": "Decide the optimal chapter count yourself",
-            "Very Short (1-2 chapters)": "Keep it very short with 1-2 chapters total",
+            "Event (1 Long Chapter)": "This is meant to only represent one event. You must only write one long chapter.",
             "Short (3-5 chapters)": "Keep it short with 3-5 chapters total",
             "Medium (6-12 chapters)": "Make it medium length with 6-12 chapters total",
             "Long (15-20 chapters)": "Make it long with 15-20 chapters total",
@@ -4491,10 +4496,10 @@ def tts_tester_page():
             combined = AudioSegment.empty()
             current_bgsfx = None
             bgsfx_offset = 0
-
-            # Chapter tracking for M4B
             chapter_timestamps = []
             current_chapter_start = 0
+
+            
             
             for j, item in enumerate(audio_items):
                 if item['type'] == 'tts':
