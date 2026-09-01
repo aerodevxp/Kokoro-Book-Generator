@@ -3035,14 +3035,16 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if result.returncode == 0:
                 log.info(f"M4B generated: {m4b_path}")
+                audiobook_path.unlink() #delete original mp3
             else:
                 log.error(f"M4B generation failed: {result.stderr[:500]}")
                 m4b_path = None
         except Exception as e:
             log.error(f"M4B generation error: {e}")
             m4b_path = None
-        
-        try: meta_file.unlink()
+        try: 
+            meta_file.unlink()
+            
         except: pass
     else:
         log.info("No chapter markers found, skipping M4B generation")
