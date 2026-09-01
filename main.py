@@ -201,7 +201,13 @@ def ensure_directories():
 def clean_text_for_tts(text):
     text = text.replace('"', '').replace('"', '').replace('"', '')
     text = text.replace(''', '').replace(''', '')
-    text = text.replace('—', ', ').replace('–', ', ')
+    text = text.replace('—', ', ').replace(';', ', ')
+    text = text.replace('…', '... ')
+    text = text.replace('\u200b', '')  # zero-width space
+    text = text.replace('\u200c', '')  # zero-width non-joiner
+    text = text.replace('\u200d', '')  # zero-width joiner
+    text = text.replace('\ufeff', '')  # BOM
+    text = text.replace('\u00a0', ' ') # non-breaking space
     text = ' '.join(text.split())
     return text.strip()
 
@@ -298,7 +304,7 @@ VOICE MIXING:
 
 CONTROL TOKENS (for TTS only — these will be removed from the text/PDF version):
 - Pauses: [pause:1.5s] inserts 1.5 seconds of silence. Use for dramatic effect or scene transitions.
-- Speech rate: [rate:1.5] speeds up speech by 1.5x until next voice change. [rate:0.7] slows it down. [rate:1.0] resets to normal.
+- Speech rate: [rate:1.5] speeds up speech by 1.5x until next voice change. [rate:0.7] slows it down. [rate:1.0] resets to normal. You may not use more than 1.5 and less than 0.5.
 - Pronunciation: [Worcester](/wˈʊstər/) speaks the IPA instead of the word. English only. You can use this to make a character say the same word but in a different way.
 - These tokens go INSIDE the voice tags, mixed with the dialogue/narration text.
 
@@ -2301,25 +2307,88 @@ def validate_tts_mp3(file_path):
         return False
 
 def split_long_text(text, max_chars=300):
-    """Split text into smaller chunks that Kokoro can handle"""
+    """Split text into smaller chunks that Kokoro can handle.
+    Preserves voice tag prefixes on all chunks."""
     if len(text) <= max_chars:
         return [text]
     
+    # Detect and extract voice tag prefix
+    voice_prefix = ""
+    voice_match = re.match(r'($$voice:[^$$]+$$)', text)
+    if voice_match:
+        voice_prefix = voice_match.group(1)
+        text_content = text[len(voice_prefix):]
+    else:
+        text_content = text
+    
+    prefix_len = len(voice_prefix)
+    effective_max = max_chars - prefix_len
+    
     chunks = []
-    # Try to split on sentence boundaries
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    
+    # Level 1: Split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', text_content)
+    
     current_chunk = ""
     
     for sentence in sentences:
-        if len(current_chunk) + len(sentence) <= max_chars:
-            current_chunk += sentence + " "
-        else:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        if len(sentence) > effective_max:
+            # Flush current chunk first
             if current_chunk:
-                chunks.append(current_chunk.strip())
-            current_chunk = sentence + " "
+                chunks.append(voice_prefix + current_chunk.strip())
+                current_chunk = ""
+            
+            # Level 2: Split long sentence on commas/semicolons/colons
+            sub_parts = re.split(r'(?<=[,;:])\s+', sentence)
+            sub_chunk = ""
+            
+            for part in sub_parts:
+                part = part.strip()
+                if not part:
+                    continue
+                    
+                if len(part) > effective_max:
+                    # Flush sub_chunk
+                    if sub_chunk:
+                        chunks.append(voice_prefix + sub_chunk.strip())
+                        sub_chunk = ""
+                    
+                    # Level 3: Split on words (hard limit)
+                    words = part.split()
+                    word_chunk = ""
+                    for word in words:
+                        if len(word_chunk) + len(word) + 1 <= effective_max:
+                            word_chunk = (word_chunk + " " + word).strip() if word_chunk else word
+                        else:
+                            if word_chunk:
+                                chunks.append(voice_prefix + word_chunk.strip())
+                            word_chunk = word
+                    if word_chunk:
+                        chunks.append(voice_prefix + word_chunk.strip())
+                else:
+                    if len(sub_chunk) + len(part) + 1 <= effective_max:
+                        sub_chunk = (sub_chunk + " " + part).strip() if sub_chunk else part
+                    else:
+                        if sub_chunk:
+                            chunks.append(voice_prefix + sub_chunk.strip())
+                        sub_chunk = part
+            
+            if sub_chunk:
+                chunks.append(voice_prefix + sub_chunk.strip())
+        else:
+            if len(current_chunk) + len(sentence) + 1 <= effective_max:
+                current_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
+            else:
+                if current_chunk:
+                    chunks.append(voice_prefix + current_chunk.strip())
+                current_chunk = sentence
     
     if current_chunk:
-        chunks.append(current_chunk.strip())
+        chunks.append(voice_prefix + current_chunk.strip())
     
     return chunks
 
@@ -2361,6 +2430,8 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             paragraphs = [p.strip() for p in kokoro_text.split('\n\n') if p.strip()]
             for para in paragraphs:
                 if len(para) > 3:
+                    # Clean special characters that break Kokoro
+                    para = clean_text_for_tts(para)
                     # Split long paragraphs into chunks Kokoro can handle
                     for chunk in split_long_text(para, max_chars=300):
                         if len(chunk) > 3:
@@ -2439,9 +2510,15 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                     
                     
                     if validate_tts_mp3(str(audio_file)):
+                        from pydub import AudioSegment as _AS
+                        seg_audio = _AS.from_file(str(audio_file))
+                        dur = len(seg_audio)
+                        chars = len(item['text'])
+                        ratio = dur / chars if chars > 0 else 0
+                        sr = seg_audio.frame_rate
+                        log.warning(f"[TTS DIAG] Seg {processed_tts}: {dur}ms, {chars}chars, {ratio:.1f}ms/char, sr={sr}Hz, file={audio_file.name}")
                         audio_items.append({'type': 'tts', 'path': str(audio_file)})
                         success = True
-                        log.debug(f"Segment {processed_tts}/{tts_count}: valid ({audio_file.stat().st_size} bytes)")
                         break
                     else:
                         log.warning(f"Segment {processed_tts}/{tts_count}: validation failed, file is {audio_file.stat().st_size if audio_file.exists() else 0} bytes")
@@ -2484,8 +2561,11 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     
     for i in range(0, len(audio_items), chunk_size):
         chunk_items = audio_items[i:i+chunk_size]
-        chunk_audio = AudioSegment.silent(duration=100)
-        
+        chunk_audio = AudioSegment.silent(duration=100, frame_rate=44100)
+        if chunk_audio.frame_rate != 44100:
+            chunk_audio = chunk_audio.set_frame_rate(44100)
+        if chunk_audio.channels != 2:
+            chunk_audio = chunk_audio.set_channels(2)
         for j, item in enumerate(chunk_items):
             if is_cancel_requested(job_id):
                 update_job_status(job_id, "error", 0, "Fusion cancelled by user")
@@ -2493,6 +2573,8 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 
             if item['type'] == 'tts':
                 tts_audio = AudioSegment.from_file(item['path'])
+                if tts_audio.frame_rate != 44100:
+                    tts_audio = tts_audio.set_frame_rate(44100)
                 tts_duration = len(tts_audio)
                 
                 if current_bgsfx:
@@ -2519,7 +2601,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 sfx_path = get_sfx_path(item['name'], is_background=False)
                 if sfx_path and sfx_path.exists():
                     try:
-                        sfx = AudioSegment.from_mp3(str(sfx_path)) - 8
+                        sfx = AudioSegment.from_mp3(str(sfx_path))
+                        if sfx.frame_rate != 44100:
+                            sfx = sfx.set_frame_rate(44100)
+                        sfx = sfx - 8
                         sfx_duration = len(sfx)
                         
                         if current_bgsfx:
@@ -2550,7 +2635,10 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 sfx_path = get_sfx_path(item['name'], is_background=True)
                 if sfx_path and sfx_path.exists():
                     try:
-                        current_bgsfx = prepare_bgsfx(AudioSegment.from_mp3(str(sfx_path)))
+                        bgsfx_raw = AudioSegment.from_mp3(str(sfx_path))
+                        if bgsfx_raw.frame_rate != 44100:
+                            bgsfx_raw = bgsfx_raw.set_frame_rate(44100)
+                        current_bgsfx = prepare_bgsfx(bgsfx_raw)
                         log.info(f"BGSFX started: {item['name']} ({len(current_bgsfx)/1000:.1f}s)")
                     except Exception as e:
                         log.error(f"BGSFX load failed: {e}")
@@ -3904,7 +3992,11 @@ def tts_tester_page():
                     paragraphs = [p.strip() for p in kokoro_text.split('\n\n') if p.strip()]
                     for para in paragraphs:
                         if len(para) > 3:
-                            timeline.append({'type': 'tts', 'text': para})
+                            para = clean_text_for_tts(para)
+                            for chunk in split_long_text(para, max_chars=300):
+                                if len(chunk) > 3:
+                                    timeline.append({'type': 'tts', 'text': chunk})
+
             
             if not timeline:
                 st.error("No text content found after preprocessing.")
@@ -3975,8 +4067,8 @@ def tts_tester_page():
             status_ph.info("Fusing audio with SFX...")
             prog_bar.progress(0.9)
             
-            pause_tts = AudioSegment.silent(duration=800)
-            pause_sfx = AudioSegment.silent(duration=200)
+            pause_tts = AudioSegment.silent(duration=800, frame_rate=44100)
+            pause_sfx = AudioSegment.silent(duration=200, frame_rate=44100)
             combined = AudioSegment.empty()
             current_bgsfx = None
             bgsfx_offset = 0
@@ -3984,6 +4076,8 @@ def tts_tester_page():
             for j, item in enumerate(audio_items):
                 if item['type'] == 'tts':
                     tts_audio = AudioSegment.from_file(item['path'])
+                    if tts_audio.frame_rate != 44100:
+                        tts_audio = tts_audio.set_frame_rate(44100)
                     tts_duration = len(tts_audio)
                     
                     if current_bgsfx:
@@ -4010,7 +4104,10 @@ def tts_tester_page():
                     sfx_path = get_sfx_path(item['name'], is_background=False)
                     if sfx_path and sfx_path.exists():
                         try:
-                            sfx = AudioSegment.from_mp3(str(sfx_path)) - 8
+                            sfx = AudioSegment.from_mp3(str(sfx_path))
+                            if sfx.frame_rate != 44100:
+                                sfx = sfx.set_frame_rate(44100)
+                            sfx = sfx - 8
                             sfx_duration = len(sfx)
                             
                             if current_bgsfx:
@@ -4041,7 +4138,10 @@ def tts_tester_page():
                     sfx_path = get_sfx_path(item['name'], is_background=True)
                     if sfx_path and sfx_path.exists():
                         try:
-                            current_bgsfx = prepare_bgsfx(AudioSegment.from_mp3(str(sfx_path)))
+                            bgsfx_raw = AudioSegment.from_mp3(str(sfx_path))
+                            if bgsfx_raw.frame_rate != 44100:
+                                bgsfx_raw = bgsfx_raw.set_frame_rate(44100)
+                            current_bgsfx = prepare_bgsfx(bgsfx_raw)
                         except:
                             current_bgsfx = None
                     else:
