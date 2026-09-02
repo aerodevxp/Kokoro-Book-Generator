@@ -685,7 +685,7 @@ def get_sfx_path(sfx_name, is_background=False):
     return None
 
 
-def fetch_new_sfx_variant(sfx_name, existing_variants, max_duration=15, can_trim=False):
+def fetch_new_sfx_variant(sfx_name, existing_variants, min_duration=3, max_duration=15, can_trim=False):
     """Fetch SFX using Freesound API duration filter + FFmpeg processing."""
     sfx_dir = Path(SFX_DIR)
     cache = load_sfx_cache()
@@ -2256,7 +2256,7 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                 files.append(str(audiobook_path))
                 if m4b_path:
                     files.append(str(m4b_path))
-                cover_path = generate_cover_image(title, synopsis if not debug_mode else "", story_dir, job_id)
+                cover_path = generate_cover_image(title, book_summary if not debug_mode else "", story_dir, job_id)
                 if cover_path:
                     embed_cover_in_mp3(str(audiobook_path), str(cover_path), title)
                     if m4b_path:
@@ -3118,7 +3118,7 @@ def generate_cover_image(title, story_summary, story_dir, job_id=None):
     if job_id:
         update_job_status(job_id, "running", 0.95, "Generating cover art...")
     
-    prompt = f"Book cover art for a story titled '{title}'. Style: atmospheric, cinematic, poster. Story summary: {story_summary[:300]}"
+    prompt = f"Book cover art for a story titled '{title}'. Style: atmospheric, cinematic, poster. Do not write any text. Use symbols and abstract shapes to convey a meaning. Story summary: {story_summary[:300]}"
     
     try:
         response = requests.post(
