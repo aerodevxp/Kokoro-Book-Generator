@@ -2445,7 +2445,7 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
                 files.append(str(audiobook_path))
                 if m4b_path:
                     files.append(str(m4b_path))
-                cover_path = generate_cover_image(title, synopsis if not debug_mode else "", story_dir, job_id)
+                cover_path = generate_cover_image(title, book_summary if not debug_mode else "", story_dir, job_id)
                 if cover_path:
                     embed_cover_in_mp3(str(audiobook_path), str(cover_path), title)
                     if m4b_path:
