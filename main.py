@@ -513,7 +513,7 @@ Example (Background SFX):
 Example (Background Music + Background SFX together):
 [bgsfx:rain_heavy][bgmusic:piano_sad] <af_heart>The storm raged outside, but the piano inside was sadder still.</af_heart> [/bgmusic][/bgsfx]
 
-Use SFX as often as you can to keep the listener's attention.
+Use SFX as often as you can to keep the listener's attention. Music is optional, but can be great to set the scene in some scenarios. If you can't find one that fits the mood, don't bother (but if you can, put it).
 
 VOICE MIXING:
 - You can mix voices using weighted ratios: <af_bella(2)+af_heart(1)>mixed voice dialogue</af_bella(2)+af_heart(1)>
