@@ -481,6 +481,8 @@ im_ Italian – Male
 pf_ Brazilian Portuguese – Female
 pm_ Brazilian Portuguese – Male
 
+Ensure the language used matched the prefix. If a character with an English voice speaks French (and they're a native speaker), temporarily change to a French voice of the same gender for the French part.
+
 SOUND EFFECTS (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
 - Use [sfx:effect_name] to insert a sound effect that interrupts speech.
 - Use [bgsfx:effect_name] to start a background sound effect, and [/bgsfx] to stop it (the closing tag cannot contain the effect name. only one bg can be played at a time, so choose wisely).
@@ -495,6 +497,8 @@ Example (Interrupting SFX):
 
 Example (Background SFX):
 [bgsfx:rain_heavy] <af_heart>The storm raged outside.</af_heart> <am_adam>We should go inside.</am_adam> [/bgsfx]
+
+Use SFX as often as you can to keep the listener's attention.
 
 VOICE MIXING:
 - You can mix voices using weighted ratios: <af_bella(2)+af_heart(1)>mixed voice dialogue</af_bella(2)+af_heart(1)>
