@@ -534,8 +534,11 @@ Example (omniscient narration with control tokens):
 Example (voice mixing for a unique character):
 <af_bella(2)+af_nova(1)>"I am something entirely new."</af_bella(2)+af_nova(1)>
 
-Example (pronunciation correction):
+You may also put words in between square brackets, and their pronounciation between (/ and /) ex: (/wˈʊstər/). It will speak the IPA between the slashes instead of the word. English only.
+Do this for small sounds like mh so that the TTS doesn't say "M"-"H" and etc...
+Example (pronunciation correction): 
 <am_michael>He lived in [Worcester](/wˈʊstər/) for years.</am_michael>
+<am_michael>[Mh](/ˈɛˈmeɪt͡ʃ/)!.</am_michael>
 """
     return instruction
 
@@ -3015,7 +3018,6 @@ def generate_tts_background(story_text, title, story_dir, job_id):
             rel_path = chunk_path.relative_to(story_dir)
             f.write(f"file '{rel_path}'\n")
     
-    # PUT IT RIGHT HERE — verify chunks exist before concat
     missing = [p for p in chunk_files if not p.exists()]
     if missing:
         log.error(f"Missing {len(missing)} chunk files before concat!")
