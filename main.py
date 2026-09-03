@@ -15,7 +15,7 @@ from fpdf import FPDF
 from mutagen.id3 import ID3, APIC, TIT2, TPE1
 from dotenv import load_dotenv
 from pydub import AudioSegment
-
+import io
 import requests
 import logging
 from logging.handlers import RotatingFileHandler
@@ -57,6 +57,7 @@ SERIES_DIR = os.getenv("SERIES_DIR", os.path.join(OUTPUT_DIR, "series"))
 FEATURES_FILE = os.getenv("FEATURES_FILE", os.path.join(OUTPUT_DIR, "features.txt"))
 JOBS_DIR = os.getenv("JOBS_DIR", os.path.join(OUTPUT_DIR, "jobs"))
 SFX_DIR = os.getenv("SFX_DIR", os.path.join(OUTPUT_DIR, "sfx"))
+BGMUSIC_DIR = os.path.join(SFX_DIR, "bgmusic")
 
 # --- LOGGING SETUP ---
 def setup_logger():
@@ -122,7 +123,7 @@ IPA_PATTERN = re.compile(r'\x5B([^\x5D]+)\x5D\x28/([^\x5D]+)/\x29')
 SFX_CACHE_FILE = os.path.join(SFX_DIR, "sfx_cache.json")
 CUSTOM_SFX_DIR = os.path.join(SFX_DIR, "custom")
 
-TEST_STORY = """[bgsfx:rain_heavy] The old mansion loomed against the stormy sky. Lightning flickered in the distance.
+TEST_STORY = """[bgsfx:rain_heavy][bgmusic:test1] The old mansion loomed against the stormy sky. Lightning flickered in the distance.
 
 <af_heart>Eleanor stood at the front door, her hand hovering over the knocker. She wasn't sure she belonged here. The invitation had arrived three days ago — unsigned, sealed with black wax, and containing nothing but an address and a time.</af_heart>
 
@@ -162,7 +163,7 @@ TEST_STORY = """[bgsfx:rain_heavy] The old mansion loomed against the stormy sky
 
 <af_heart>She followed the music.</af_heart>
 
-[/bgsfx]
+[/bgmusic][/bgsfx]
 
 <af_heart>The storm raged outside, but inside the mansion, the only sound was the piano — and Eleanor's footsteps on the dusty carpet. [sfx: footsteps.] Each step took her deeper into the house, past portraits with eyes that seemed to follow her, past doors that seemed to breathe.</af_heart>
 
@@ -176,7 +177,8 @@ TEST_STORY = """[bgsfx:rain_heavy] The old mansion loomed against the stormy sky
 
 <af_heart>Eleanor screamed. [sfx: scream.] The candles went out. The door slammed. [sfx:door_slam]</af_heart>
 
-[bgsfx:wind_howl] <af_heart>And then there was nothing but the wind, and the dark, and the sound of piano keys pressing themselves in the empty room.</af_heart>"""
+[bgsfx:wind_howl][bgmusic:test2] <af_heart>And then there was nothing but the wind, and the dark, and the sound of piano keys pressing themselves in the empty room.</af_heart> [/bgmusic][/bgsfx]"""
+
 
 @st.cache_resource
 def get_clients():
@@ -194,7 +196,8 @@ def read_base_prompt():
         return ""
 
 def ensure_directories():
-    dirs = [OUTPUT_DIR, WORLDBOOK_DIR, SERIES_DIR, JOBS_DIR, SFX_DIR, CUSTOM_SFX_DIR, os.path.join(SFX_DIR, "bgsfx")]
+    dirs = [OUTPUT_DIR, WORLDBOOK_DIR, SERIES_DIR, JOBS_DIR, SFX_DIR, CUSTOM_SFX_DIR, 
+        os.path.join(SFX_DIR, "bgsfx"), BGMUSIC_DIR]
     for directory in dirs:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
@@ -440,14 +443,16 @@ def convert_existing_to_m4b(story_path, job_id=None):
     
     return True, str(m4b_path)
 
-def build_voice_instruction(character_voices=None, available_sfx_interrupting=None, available_sfx_bgsfx=None):    
+def build_voice_instruction(character_voices=None, available_sfx_interrupting=None, available_sfx_bgsfx=None, available_bgmusic=None):    
     sfx_instruction = ""
     if available_sfx_interrupting:
         sfx_instruction += f"Available INTERRUPTING SFX (use [sfx:name]): {', '.join(available_sfx_interrupting)}\n"
     if available_sfx_bgsfx:
-        sfx_instruction += f"Available BACKGROUND SFX (use [bgsfx:name]): {', '.join(available_sfx_bgsfx)}"
+        sfx_instruction += f"Available BACKGROUND SFX (use [bgsfx:name]): {', '.join(available_sfx_bgsfx)}\n"
+    if available_bgmusic:
+        sfx_instruction += f"Available BACKGROUND MUSIC (use [bgmusic:name]): {', '.join(available_bgmusic)}\n"
     if not sfx_instruction:
-        sfx_instruction = "No SFX cached locally."
+        sfx_instruction = "No SFX/music cached locally."
 
     instruction = f"""
 VOICE TAG INSTRUCTIONS:
@@ -483,13 +488,20 @@ pm_ Brazilian Portuguese – Male
 
 Ensure the language used matched the prefix. If a character with an English voice speaks French (and they're a native speaker), temporarily change to a French voice of the same gender for the French part.
 
-SOUND EFFECTS (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
+SOUND EFFECTS and MIXING (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
 - Use [sfx:effect_name] to insert a sound effect that interrupts speech.
 - Use [bgsfx:effect_name] to start a background sound effect, and [/bgsfx] to stop it (the closing tag cannot contain the effect name. only one bg can be played at a time, so choose wisely).
 - Background sounds continue across multiple paragraphs/voice clips until stopped.
 - You can use ANY descriptive effect name, SFW OR NSFW. If it's not cached locally, it will be fetched automatically.
 - Use descriptive names: door_creak, glass_shatter, wolf_howl, sword_clash, rain_heavy, crowd_market
 - Place SFX tags INSIDE voice tags where the sound should occur.
+- Use [bgmusic:track_name] to start background music, and [/bgmusic] to stop it.
+- Background music plays IN PARALLEL with background SFX — you can have both [bgsfx:] and [bgmusic:] active at the same time.
+- Use [bgmusic:] for musical beds, scores, drones, melodies. Use [bgsfx:] for non-musical ambience (rain, wind, crowd noise).
+- Music continues across multiple paragraphs/voice clips until stopped with [/bgmusic].
+- Only ONE music track can play at a time. Choose wisely. You can only choose from cached available music.
+- Place [bgmusic:] and [/bgmusic] tags OUTSIDE voice tags, on their own line or at the start/end of a paragraph.
+
 {sfx_instruction}
 
 Example (Interrupting SFX):
@@ -497,6 +509,9 @@ Example (Interrupting SFX):
 
 Example (Background SFX):
 [bgsfx:rain_heavy] <af_heart>The storm raged outside.</af_heart> <am_adam>We should go inside.</am_adam> [/bgsfx]
+
+Example (Background Music + Background SFX together):
+[bgsfx:rain_heavy][bgmusic:piano_sad] <af_heart>The storm raged outside, but the piano inside was sadder still.</af_heart> [/bgmusic][/bgsfx]
 
 Use SFX as often as you can to keep the listener's attention.
 
@@ -603,14 +618,33 @@ def get_mp3_duration(file_path):
         pass
     return 0
 
-def get_sfx_path(sfx_name, is_background=False):
+def get_sfx_path(sfx_name, is_background=False, bgmusic=False):
     """Get path to SFX file, considering custom/manual locations and variants."""
     sfx_dir = Path(SFX_DIR)
     custom_dir = Path(CUSTOM_SFX_DIR)
     bgsfx_dir = Path(SFX_DIR) / "bgsfx"
+    bgmusic_dir = Path(BGMUSIC_DIR)
     variants = []
 
-    if is_background:
+    if bgmusic:
+        # bgmusic: only check sfx/bgmusic/
+        base_path = bgmusic_dir / f"{sfx_name}.mp3"
+        if base_path.exists() and validate_mp3(str(base_path)):
+            variants.append(base_path)
+
+        # Check for variants in sfx/bgmusic/
+        for variant_path in bgmusic_dir.glob(f"{sfx_name}_*.mp3"):
+            if "_temp" in variant_path.name:
+                continue
+            suffix = variant_path.stem[len(sfx_name) + 1:]
+            if re.match(r'^\d+$', suffix) and validate_mp3(str(variant_path)):
+                variants.append(variant_path)
+
+        if not variants:
+            log.warning(f"BGMUSIC '{sfx_name}' not found in '{bgmusic_dir}'. Skipping.")
+            return None
+    
+    elif is_background:
         # Background SFX: only check sfx/bgsfx/
         base_path = bgsfx_dir / f"{sfx_name}.mp3"
         if base_path.exists() and validate_mp3(str(base_path)):
@@ -916,19 +950,18 @@ def fetch_new_sfx_variant(sfx_name, existing_variants, min_duration=3, max_durat
         return None
 
 def get_available_sfx():
-    """Get lists of available interrupting and background SFX names."""
     interrupting_names = set()
     background_names = set()
+    bgmusic_names = set()
     sfx_dir = Path(SFX_DIR)
     custom_dir = Path(CUSTOM_SFX_DIR)
     bgsfx_dir = Path(SFX_DIR) / "bgsfx"
+    bgmusic_dir = Path(BGMUSIC_DIR)
 
-    # Helper to extract base name (without _N suffix)
     def get_base_name(path):
         stem = path.stem
         return re.sub(r'_\d+$', '', stem)
 
-    # Scan interrupting SFX (sfx/ and sfx/custom/)
     for directory in [sfx_dir, custom_dir]:
         if directory.exists():
             for f in directory.glob("*.mp3"):
@@ -936,14 +969,19 @@ def get_available_sfx():
                     continue
                 interrupting_names.add(get_base_name(f))
 
-    # Scan background SFX (sfx/bgsfx/)
     if bgsfx_dir.exists():
         for f in bgsfx_dir.glob("*.mp3"):
             if "_temp" in f.name:
                 continue
             background_names.add(get_base_name(f))
 
-    return sorted(list(interrupting_names)), sorted(list(background_names))
+    if bgmusic_dir.exists():
+        for f in bgmusic_dir.glob("*.mp3"):
+            if "_temp" in f.name:
+                continue
+            bgmusic_names.add(get_base_name(f))
+
+    return sorted(list(interrupting_names)), sorted(list(background_names)), sorted(list(bgmusic_names))
 
 def load_sfx_cache():
     try:
@@ -1168,21 +1206,15 @@ def sanitize_title(title):
     return safe_title or "Untitled-Story"
 
 def remove_voice_tags(text):
-    """Remove voice tags AND control tokens from text for TXT/PDF output"""
-    # Remove voice tags (keep content)
     clean_text = re.sub(r'<([^>]+)>([^<]*)</\1>', r'\2', text)
-    # Remove pause tokens entirely
     clean_text = PAUSE_PATTERN.sub('', clean_text)
-    # Remove rate tokens entirely  
     clean_text = RATE_PATTERN.sub('', clean_text)
-    # Replace IPA pronunciation with just the word
     clean_text = IPA_PATTERN.sub(r'\1', clean_text)
     
-    # FIXED: Remove SFX and BGSFX tags entirely (handles spaces, numbers, punctuation)
     clean_text = re.sub(r'\x5Bsfx:[^\x5D]+\x5D', '', clean_text, flags=re.IGNORECASE)
     clean_text = re.sub(r'\x5B/?bgsfx(?::[^\x5D]*)?\x5D', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'\x5B/?bgmusic(?::[^\x5D]*)?\x5D', '', clean_text, flags=re.IGNORECASE)  # ← NEW
 
-    # Clean up any double spaces left behind by removed tags
     clean_text = re.sub(r'  +', ' ', clean_text)
     return clean_text
 
@@ -1275,7 +1307,11 @@ def extract_mixed_voices(text):
     return aliases
 
 def preprocess_sfx_in_voice_tags(text):
-    pattern = re.compile(r'<([^>]+)>([^<]*?)(\x5Bsfx:[a-z0-9_]+\x5D|\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D)([^<]*?)</\1>', re.IGNORECASE)
+    #regex is killing me x-x
+    pattern = re.compile(
+        r'<([^>]+)>([^<]*?)(\x5Bsfx:[a-z0-9_]+\x5D|\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D|\x5Bbgmusic:[a-z0-9_]+\x5D|\x5B/bgmusic\x5D)([^<]*?)</\1>',
+        re.IGNORECASE
+    )
     while True:
         new_text = pattern.sub(r'<\1>\2</\1> \3 <\1>\4</\1>', text)
         if new_text == text:
@@ -1526,24 +1562,21 @@ def repair_orphaned_tags(text):
     return '\n\n'.join(fixed_paragraphs)
 
 def fix_sfx_tags(text):
-    """Normalizes SFX tags (fixes spaces, strips punctuation) and auto-closes unclosed BGSFX tags"""
-    # Normalize tags: [sfx: rain.] -> [sfx:rain], [sfx:footsteps_2] -> [sfx:footsteps_2]
     def clean_sfx(match):
         tag_type = match.group(1)
         name = match.group(2)
-        # Remove any punctuation (periods, commas, etc.) and replace spaces with underscores
         name = re.sub(r'[^a-zA-Z0-9_ ]', '', name)
         name = name.replace(' ', '_')
         return f"[{tag_type}:{name}]"
     
-    # FIXED: Match ANY characters except ] so we can catch and clean punctuation
-    text = re.sub(r'\x5B(sfx|bgsfx):\s*([^\x5D]+)\x5D', clean_sfx, text, flags=re.IGNORECASE)
+    # Add bgmusic to the normalization regex
+    text = re.sub(r'\x5B(sfx|bgsfx|bgmusic):\s*([^\x5D]+)\x5D', clean_sfx, text, flags=re.IGNORECASE)
 
-    
-    # Auto-close unclosed bgsfx tags
+    # Auto-close unclosed bgsfx AND bgmusic tags
     fixed_text = ""
     open_bgsfx = False
-    pattern = re.compile(r'(\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D)', re.IGNORECASE)
+    open_bgmusic = False
+    pattern = re.compile(r'(\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D|\x5Bbgmusic:[a-z0-9_]+\x5D|\x5B/bgmusic\x5D)', re.IGNORECASE)
     last_end = 0
     
     for match in pattern.finditer(text):
@@ -1552,7 +1585,6 @@ def fix_sfx_tags(text):
         
         if tag.lower().startswith('[bgsfx:'):
             if open_bgsfx:
-                # Auto close previous bgsfx before opening new one
                 fixed_text += '[/bgsfx] '
             fixed_text += tag
             open_bgsfx = True
@@ -1560,12 +1592,23 @@ def fix_sfx_tags(text):
             if open_bgsfx:
                 fixed_text += tag
                 open_bgsfx = False
+        elif tag.lower().startswith('[bgmusic:'):
+            if open_bgmusic:
+                fixed_text += '[/bgmusic] '
+            fixed_text += tag
+            open_bgmusic = True
+        elif tag.lower() == '[/bgmusic]':
+            if open_bgmusic:
+                fixed_text += tag
+                open_bgmusic = False
         last_end = match.end()
         
     fixed_text += text[last_end:]
     
     if open_bgsfx:
         fixed_text += ' [/bgsfx]'
+    if open_bgmusic:
+        fixed_text += ' [/bgmusic]'
         
     return fixed_text
 
@@ -1931,7 +1974,8 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
                 wb_content = f.read()
             character_voices = extract_character_voices(wb_content)
         
-        available_sfx_interrupting, available_sfx_bgsfx = get_available_sfx()
+        available_sfx_interrupting, available_sfx_bgsfx, available_bgmusic = get_available_sfx()
+
         voice_instruction = build_voice_instruction(character_voices if character_voices else None, available_sfx_interrupting, available_sfx_bgsfx)
 
         story_context = load_story_context(reference_story, job_id)
@@ -1943,6 +1987,8 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             update_job_status(job_id, "running", 0.1, "Debug mode: Loaded test story.", title=title)
             book_summary = ""
             chapter_summaries = []
+            total_chapters = 1
+            outline = ""
         else:
             if quick_test:
                 length_instruction = "Write EXACTLY ONE chapter. Do not write more than 1 chapter."
@@ -2030,11 +2076,13 @@ List each chapter with a brief description."""
             log.info(f"Outline generated ({token_count} tokens, {len(outline)} chars)")
             
             chapter_matches = re.findall(r'(?:Chapter|chapter)\s+(\d+)', outline, re.IGNORECASE)
-            if quick_test:
-                total_chapters = 1
-            else:         
+            
+            if not quick_test:         
                 total_chapters = max([int(x) for x in chapter_matches]) if chapter_matches else 10
+            else:
+                total_chapters = 1
             update_job_status(job_id, "running", 0.1, f"Detected {total_chapters} chapters.")
+            log.warning(f"Detected {total_chapters} chapters.")
             
             # PHASE 1b: SYNOPSIS (non-spoiler) for approval
             if not quick_test and not debug_mode:
@@ -2070,8 +2118,8 @@ Synopsis (no spoilers, 2-3 sentences):"""
         
         # PHASE 2: WRITE STORY (reached via direct call or after approval)
         # This part is now in a separate function run_story_continuation_worker
-        # But for debug/quick_test, we continue inline:
-        if debug_mode or quick_test:
+        # But for quick_test, we continue inline:
+        if quick_test:
             story_parts = []
             
             for chapter_num in range(1, total_chapters + 1):
@@ -2308,7 +2356,7 @@ def run_story_continuation_worker(job_id, outline, topic, genre, story_type, ref
                 wb_content = f.read()
             character_voices = extract_character_voices(wb_content)
         
-        available_sfx_interrupting, available_sfx_bgsfx = get_available_sfx()
+        available_sfx_interrupting, available_sfx_bgsfx, available_bgmusic = get_available_sfx()
         voice_instruction = build_voice_instruction(character_voices if character_voices else None, available_sfx_interrupting, available_sfx_bgsfx)
         story_context = load_story_context(reference_story, job_id)
         worldbook_context = load_worldbook_context(worldbook_path)
@@ -2716,7 +2764,7 @@ def generate_tts_background(story_text, title, story_dir, job_id):
 
     voice_aliases = extract_mixed_voices(story_text)
     
-    SPLIT_PATTERN = re.compile(r'(\x5Bsfx:[a-z0-9_]+\x5D|\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D)', re.IGNORECASE)
+    SPLIT_PATTERN = re.compile(r'(\x5Bsfx:[a-z0-9_]+\x5D|\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D|\x5Bbgmusic:[a-z0-9_]+\x5D|\x5B/bgmusic\x5D)', re.IGNORECASE)
     parts = [p for p in SPLIT_PATTERN.split(story_text) if p.strip()]
     
     timeline = []
@@ -2727,13 +2775,19 @@ def generate_tts_background(story_text, title, story_dir, job_id):
         
         sfx_match = re.match(r'\x5Bsfx:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
         bgsfx_start_match = re.match(r'\x5Bbgsfx:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
+        bgmusic_start_match = re.match(r'\x5Bbgmusic:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
+
         
         if sfx_match:
             timeline.append({'type': 'sfx', 'name': sfx_match.group(1).lower()})
         elif bgsfx_start_match:
             timeline.append({'type': 'bgsfx_start', 'name': bgsfx_start_match.group(1).lower()})
+        elif bgmusic_start_match:
+            timeline.append({'type': 'bgmusic_start', 'name': bgmusic_start_match.group(1).lower()})
         elif part.lower() == '[/bgsfx]':
             timeline.append({'type': 'bgsfx_stop'})
+        elif part.lower() == '[/bgmusic]':
+            timeline.append({'type': 'bgmusic_stop'})
         else:
             kokoro_text = convert_to_kokoro_format(part, voice_aliases)
             kokoro_text = re.sub(r'^#{1,6}\s+', '', kokoro_text, flags=re.MULTILINE)
@@ -2875,6 +2929,12 @@ def generate_tts_background(story_text, title, story_dir, job_id):
     
     current_bgsfx = None
     bgsfx_offset = 0
+
+    current_bgmusic = None      # Active music bed (AudioSegment)
+    current_bgmusic_path = None # Path to file
+    current_bgmusic_len = 0      # Length in ms
+    current_bgmusic_offset = 0
+
     # Chapter tracking for M4B
     chapter_timestamps = []
     current_chapter_start = 0
@@ -2897,25 +2957,50 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                     tts_audio = tts_audio.set_frame_rate(44100)
                 tts_duration = len(tts_audio)
                 
+                # Prepare base audio (TTS or TTS+SFX)
+                base_audio = tts_audio
+
+                # Apply bgsfx if active
                 if current_bgsfx:
                     bgsfx_len = len(current_bgsfx)
-                    needed_duration = tts_duration
                     start_ms = bgsfx_offset % bgsfx_len
-                    
+                    # Slice bgsfx to match tts duration
                     bgsfx_slice = AudioSegment.empty()
                     current_pos = 0
-                    while current_pos < needed_duration:
-                        take = min(bgsfx_len - start_ms, needed_duration - current_pos)
+                    while current_pos < tts_duration:
+                        take = min(bgsfx_len - start_ms, tts_duration - current_pos)
                         bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
                         current_pos += take
                         start_ms = 0
-                        
-                    bgsfx_slice = bgsfx_slice - 28
-                    mixed = tts_audio.overlay(bgsfx_slice)
-                    chunk_audio += mixed
-                else:
-                    chunk_audio += tts_audio
+                    bgsfx_slice = bgsfx_slice - 28  # Apply volume reduction
+                    base_audio = base_audio.overlay(bgsfx_slice)
+
+                # Apply bgmusic if active
+                if current_bgmusic_path:
+                    try:
+                        # Pull slice from disk (no full load)
+                        cmd = [
+                            'ffmpeg', '-y',
+                            '-stream_loop', '-1',
+                            '-ss', f'{current_bgmusic_offset/1000:.3f}',
+                            '-t', f'{tts_duration/1000:.3f}',
+                            '-i', current_bgmusic_path,
+                            '-af', 'volume=-30dB',  # Music quieter than ambient
+                            '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', '-f', 'wav', '-'
+                        ]
+                        proc = subprocess.run(cmd, capture_output=True, timeout=10)
+                        if proc.returncode == 0:
+                            music_slice = AudioSegment.from_file(io.BytesIO(proc.stdout))
+                            base_audio = base_audio.overlay(music_slice)
+                        else:
+                            log.warning(f"[bgmusic] FFmpeg slice failed for {current_bgmusic_path}")
+                    except Exception as e:
+                        log.warning(f"[bgmusic] Slice error: {e}")
+
+                # Commit final mixed audio
+                chunk_audio += base_audio
                 bgsfx_offset += tts_duration
+                current_bgmusic_offset += tts_duration
                 
             elif item['type'] == 'sfx':
                 sfx_path = get_sfx_path(item['name'], is_background=False)
@@ -2927,30 +3012,49 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                         sfx = sfx - 8
                         sfx_duration = len(sfx)
                         
+                        base_audio = sfx  # ← was tts_audio (BUG)
+
                         if current_bgsfx:
                             bgsfx_len = len(current_bgsfx)
-                            needed_duration = sfx_duration
                             start_ms = bgsfx_offset % bgsfx_len
-                            
                             bgsfx_slice = AudioSegment.empty()
                             current_pos = 0
-                            while current_pos < needed_duration:
-                                take = min(bgsfx_len - start_ms, needed_duration - current_pos)
+                            while current_pos < sfx_duration:  # ← was tts_duration
+                                take = min(bgsfx_len - start_ms, sfx_duration - current_pos)
                                 bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
                                 current_pos += take
                                 start_ms = 0
-                                
                             bgsfx_slice = bgsfx_slice - 28
-                            mixed_sfx = sfx.overlay(bgsfx_slice)
-                            chunk_audio += mixed_sfx
-                        else:
-                            chunk_audio += sfx
-                        bgsfx_offset += sfx_duration
+                            base_audio = base_audio.overlay(bgsfx_slice)
+
+                        if current_bgmusic_path:
+                            try:
+                                cmd = [
+                                    'ffmpeg', '-y',
+                                    '-stream_loop', '-1',
+                                    '-ss', f'{current_bgmusic_offset/1000:.3f}',
+                                    '-t', f'{sfx_duration/1000:.3f}',  # ← was tts_duration
+                                    '-i', current_bgmusic_path,
+                                    '-af', 'volume=-30dB',
+                                    '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', '-f', 'wav', '-'
+                                ]
+                                proc = subprocess.run(cmd, capture_output=True, timeout=10)
+                                if proc.returncode == 0:
+                                    music_slice = AudioSegment.from_file(io.BytesIO(proc.stdout))
+                                    base_audio = base_audio.overlay(music_slice)
+                                else:
+                                    log.warning(f"[bgmusic] FFmpeg slice failed for {current_bgmusic_path}")
+                            except Exception as e:
+                                log.warning(f"[bgmusic] Slice error: {e}")
+
+                        chunk_audio += base_audio
+                        bgsfx_offset += sfx_duration  # ← was tts_duration
+                        current_bgmusic_offset += sfx_duration  # ← was tts_duration
                     except Exception as e:
                         log.error(f"SFX load failed: {e}")
                 else:
                     log.warning(f"SFX not found: {item['name']}")
-                    
+
             elif item['type'] == 'bgsfx_start':
                 sfx_path = get_sfx_path(item['name'], is_background=True)
                 if sfx_path and sfx_path.exists():
@@ -2970,6 +3074,26 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 current_bgsfx = None
                 log.warning(f"[INFO] BGSFX stopped")
             
+            elif item['type'] == 'bgmusic_start':
+                sfx_path = get_sfx_path(item['name'], is_background=True, bgmusic=True)  # ← new arg
+                if sfx_path and sfx_path.exists():
+                    try:
+                        current_bgmusic_path = str(sfx_path)
+                        raw_music = AudioSegment.from_file(current_bgmusic_path)
+                        current_bgmusic_len = len(raw_music)
+                        current_bgmusic_offset = 0
+                        log.info(f"[bgmusic] Started: {item['name']} ({current_bgmusic_len/1000:.1f}s)")
+                    except Exception as e:
+                        log.error(f"[bgmusic] Load failed: {e}")
+                        current_bgmusic_path = None
+                else:
+                    log.warning(f"[bgmusic] Not found: {item['name']}")
+                    current_bgmusic_path = None
+
+            elif item['type'] == 'bgmusic_stop':
+                current_bgmusic_path = None
+                log.info("[bgmusic] Stopped")
+            
             elif item['type'] == 'chapter_end':
                 chapter_timestamps.append((current_chapter_start, bgsfx_offset))
                 current_chapter_start = bgsfx_offset
@@ -2980,11 +3104,15 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                 else:
                     pause_dur = pause_tts if item['type'] == 'tts' else pause_sfx
                 
+                # Start with silent pause
+                base_pause = pause_dur
+
+                # Overlay bgsfx if active
                 if current_bgsfx:
                     bgsfx_len = len(current_bgsfx)
-                    needed_duration = len(pause_dur)
+                    needed_duration = len(base_pause)
                     start_ms = bgsfx_offset % bgsfx_len
-                    
+
                     bgsfx_slice = AudioSegment.empty()
                     current_pos = 0
                     while current_pos < needed_duration:
@@ -2992,12 +3120,38 @@ def generate_tts_background(story_text, title, story_dir, job_id):
                         bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
                         current_pos += take
                         start_ms = 0
-                        
+
                     bgsfx_slice = bgsfx_slice - 28
-                    chunk_audio += bgsfx_slice
-                else:
-                    chunk_audio += pause_dur
-                bgsfx_offset += len(pause_dur)
+                    base_pause = base_pause.overlay(bgsfx_slice)
+
+                # Overlay bgmusic if active
+                if current_bgmusic_path:
+                    try:
+                        # Pull slice from disk using FFmpeg
+                        cmd = [
+                            'ffmpeg', '-y',
+                            '-stream_loop', '-1',
+                            '-ss', f'{current_bgmusic_offset/1000:.3f}',
+                            '-t', f'{len(base_pause)/1000:.3f}',
+                            '-i', current_bgmusic_path,
+                            '-af', 'volume=-30dB',
+                            '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', '-f', 'wav', '-'
+                        ]
+                        proc = subprocess.run(cmd, capture_output=True, timeout=10)
+                        if proc.returncode == 0:
+                            music_slice = AudioSegment.from_file(io.BytesIO(proc.stdout))
+                            base_pause = base_pause.overlay(music_slice)
+                        else:
+                            log.warning(f"[bgmusic] FFmpeg slice failed for {current_bgmusic_path}")
+                    except Exception as e:
+                        log.warning(f"[bgmusic] Slice error during pause: {e}")
+
+                # Append final pause audio
+                chunk_audio += base_pause
+
+                # Advance offsets
+                bgsfx_offset += len(base_pause)
+                current_bgmusic_offset += len(base_pause)
         
         # NEW: Export as WAV (10x faster than MP3, FFmpeg will encode to MP3 at the end)
         chunk_path = temp_dir / f"chunk_{chunk_num:04d}.wav"
@@ -4414,23 +4568,31 @@ def tts_tester_page():
     
     with col2:
         # Get separate lists for display
-        all_cached_interrupting, all_cached_bgsfx = get_available_sfx()
+        all_cached_interrupting, all_cached_bgsfx, all_cached_bgmusic = get_available_sfx()
         
         # Detect SFX used in the test text
         sfx_matches = re.findall(r'\x5Bsfx:([a-z0-9_]+)\x5D', test_text, re.IGNORECASE)
         bgsfx_matches = re.findall(r'\x5Bbgsfx:([a-z0-9_]+)\x5D', test_text, re.IGNORECASE)
+        bgmusic_matches = re.findall(r'\x5Bbgmusic:([a-z0-9_]+)\x5D', test_text, re.IGNORECASE)
+
         
         # Determine status for SFX matches found in text
         sfx_status_lines = []
         bgsfx_status_lines = []
+        bgmusic_status_lines = []
         for s in sfx_matches:
             status = "✅ Cached" if s in all_cached_interrupting else ("🔄 Fetched" if FREESOUND_API_KEY else "❌ Not Found/Fetch Disabled")
             sfx_status_lines.append(f"• `[sfx:{s}]` — {status}")
         for s in bgsfx_matches:
             status = "✅ Cached" if s in all_cached_bgsfx else "❌ Not Found (Skipped)"
             bgsfx_status_lines.append(f"• `[bgsfx:{s}]` — {status}")
+        
+        for s in bgmusic_matches:
+            status = "✅ Cached" if s in all_cached_bgmusic else "❌ Not Found (Skipped)"
+            bgmusic_status_lines.append(f"• `[bgmusic:{s}]` — {status}")
 
-        total_sfx = len(sfx_matches) + len(bgsfx_matches)
+        total_sfx = len(sfx_matches) + len(bgsfx_matches) + len(bgmusic_matches)
+
         st.metric("SFX Detected", total_sfx)
         if total_sfx:
             with st.expander("View SFX Status"):
@@ -4441,6 +4603,10 @@ def tts_tester_page():
                 if bgsfx_status_lines:
                     st.write("**Background SFX:**")
                     for line in bgsfx_status_lines:
+                        st.write(line)
+                if bgmusic_status_lines:
+                    st.write("**Background Music:**")
+                    for line in bgmusic_status_lines:
                         st.write(line)
     
     with col3:
@@ -4475,7 +4641,7 @@ def tts_tester_page():
             voice_aliases = extract_mixed_voices(processed_text)
             
             # Split into timeline
-            SPLIT_PATTERN = re.compile(r'(\x5Bsfx:[a-z0-9_]+\x5D|\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D)', re.IGNORECASE)
+            SPLIT_PATTERN = re.compile(r'(\x5Bsfx:[a-z0-9_]+\x5D|\x5Bbgsfx:[a-z0-9_]+\x5D|\x5B/bgsfx\x5D|\x5Bbgmusic:[a-z0-9_]+\x5D|\x5B/bgmusic\x5D)', re.IGNORECASE)
             parts = [p for p in SPLIT_PATTERN.split(processed_text) if p.strip()]
             
             timeline = []
@@ -4486,13 +4652,19 @@ def tts_tester_page():
                 
                 sfx_match = re.match(r'\x5Bsfx:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
                 bgsfx_start_match = re.match(r'\x5Bbgsfx:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
+                bgmusic_start_match = re.match(r'\x5Bbgmusic:([a-z0-9_]+)\x5D', part, re.IGNORECASE)
+
                 
                 if sfx_match:
                     timeline.append({'type': 'sfx', 'name': sfx_match.group(1).lower()})
                 elif bgsfx_start_match:
                     timeline.append({'type': 'bgsfx_start', 'name': bgsfx_start_match.group(1).lower()})
+                elif bgmusic_start_match:
+                    timeline.append({'type': 'bgmusic_start', 'name': bgmusic_start_match.group(1).lower()})
                 elif part.lower() == '[/bgsfx]':
                     timeline.append({'type': 'bgsfx_stop'})
+                elif part.lower() == '[/bgmusic]':
+                    timeline.append({'type': 'bgmusic_stop'})
                 else:
                     kokoro_text = convert_to_kokoro_format(part, voice_aliases)
                     kokoro_text = re.sub(r'^#{1,6}\s+', '', kokoro_text, flags=re.MULTILINE)
@@ -4575,17 +4747,17 @@ def tts_tester_page():
             # Fuse audio
             status_ph.info("Fusing audio with SFX...")
             prog_bar.progress(0.9)
-            
+
             pause_tts = AudioSegment.silent(duration=800, frame_rate=44100)
             pause_sfx = AudioSegment.silent(duration=200, frame_rate=44100)
             combined = AudioSegment.empty()
             current_bgsfx = None
             bgsfx_offset = 0
+            current_bgmusic_path = None
+            current_bgmusic_offset = 0
             chapter_timestamps = []
             current_chapter_start = 0
 
-            
-            
             for j, item in enumerate(audio_items):
                 if item['type'] == 'tts':
                     tts_audio = AudioSegment.from_file(item['path'])
@@ -4593,25 +4765,43 @@ def tts_tester_page():
                         tts_audio = tts_audio.set_frame_rate(44100)
                     tts_duration = len(tts_audio)
                     
+                    base_audio = tts_audio
+                    
                     if current_bgsfx:
                         bgsfx_len = len(current_bgsfx)
-                        needed_duration = tts_duration
                         start_ms = bgsfx_offset % bgsfx_len
-                        
                         bgsfx_slice = AudioSegment.empty()
                         current_pos = 0
-                        while current_pos < needed_duration:
-                            take = min(bgsfx_len - start_ms, needed_duration - current_pos)
+                        while current_pos < tts_duration:
+                            take = min(bgsfx_len - start_ms, tts_duration - current_pos)
                             bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
                             current_pos += take
                             start_ms = 0
-                        
                         bgsfx_slice = bgsfx_slice - 28
-                        mixed = tts_audio.overlay(bgsfx_slice)
-                        combined += mixed
-                    else:
-                        combined += tts_audio
+                        base_audio = base_audio.overlay(bgsfx_slice)
+                    
+                    if current_bgmusic_path:
+                        try:
+                            cmd = [
+                                'ffmpeg', '-y', '-stream_loop', '-1',
+                                '-ss', f'{current_bgmusic_offset/1000:.3f}',
+                                '-t', f'{tts_duration/1000:.3f}',
+                                '-i', current_bgmusic_path,
+                                '-af', 'volume=-30dB',
+                                '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', '-f', 'wav', '-'
+                            ]
+                            proc = subprocess.run(cmd, capture_output=True, timeout=10)
+                            if proc.returncode == 0:
+                                music_slice = AudioSegment.from_file(io.BytesIO(proc.stdout))
+                                base_audio = base_audio.overlay(music_slice)
+                            else:
+                                st.warning(f"[bgmusic] FFmpeg slice failed")
+                        except Exception as e:
+                            st.warning(f"[bgmusic] Slice error: {e}")
+                    
+                    combined += base_audio
                     bgsfx_offset += tts_duration
+                    current_bgmusic_offset += tts_duration
                     
                 elif item['type'] == 'sfx':
                     sfx_path = get_sfx_path(item['name'], is_background=False)
@@ -4623,25 +4813,41 @@ def tts_tester_page():
                             sfx = sfx - 8
                             sfx_duration = len(sfx)
                             
+                            base_audio = sfx
+                            
                             if current_bgsfx:
                                 bgsfx_len = len(current_bgsfx)
-                                needed_duration = sfx_duration
                                 start_ms = bgsfx_offset % bgsfx_len
-                                
                                 bgsfx_slice = AudioSegment.empty()
                                 current_pos = 0
-                                while current_pos < needed_duration:
-                                    take = min(bgsfx_len - start_ms, needed_duration - current_pos)
+                                while current_pos < sfx_duration:
+                                    take = min(bgsfx_len - start_ms, sfx_duration - current_pos)
                                     bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
                                     current_pos += take
                                     start_ms = 0
-                                
                                 bgsfx_slice = bgsfx_slice - 28
-                                mixed_sfx = sfx.overlay(bgsfx_slice)
-                                combined += mixed_sfx
-                            else:
-                                combined += sfx
+                                base_audio = base_audio.overlay(bgsfx_slice)
+                            
+                            if current_bgmusic_path:
+                                try:
+                                    cmd = [
+                                        'ffmpeg', '-y', '-stream_loop', '-1',
+                                        '-ss', f'{current_bgmusic_offset/1000:.3f}',
+                                        '-t', f'{sfx_duration/1000:.3f}',
+                                        '-i', current_bgmusic_path,
+                                        '-af', 'volume=-30dB',
+                                        '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', '-f', 'wav', '-'
+                                    ]
+                                    proc = subprocess.run(cmd, capture_output=True, timeout=10)
+                                    if proc.returncode == 0:
+                                        music_slice = AudioSegment.from_file(io.BytesIO(proc.stdout))
+                                        base_audio = base_audio.overlay(music_slice)
+                                except Exception as e:
+                                    st.warning(f"[bgmusic] Slice error: {e}")
+                            
+                            combined += base_audio
                             bgsfx_offset += sfx_duration
+                            current_bgmusic_offset += sfx_duration
                         except Exception as e:
                             st.warning(f"SFX load failed: {e}")
                     else:
@@ -4662,15 +4868,32 @@ def tts_tester_page():
                         
                 elif item['type'] == 'bgsfx_stop':
                     current_bgsfx = None
+                
+                elif item['type'] == 'bgmusic_start':
+                    sfx_path = get_sfx_path(item['name'], is_background=True, bgmusic=True)
+                    if sfx_path and sfx_path.exists():
+                        try:
+                            current_bgmusic_path = str(sfx_path)
+                            current_bgmusic_offset = 0
+                        except Exception as e:
+                            st.warning(f"[bgmusic] Load failed: {e}")
+                            current_bgmusic_path = None
+                    else:
+                        st.warning(f"[bgmusic] Not found: {item['name']}")
+                        current_bgmusic_path = None
+
+                elif item['type'] == 'bgmusic_stop':
+                    current_bgmusic_path = None
                     
                 if j < len(audio_items) - 1:
                     pause_dur = pause_tts if item['type'] == 'tts' else pause_sfx
                     
+                    base_pause = pause_dur
+                    
                     if current_bgsfx:
                         bgsfx_len = len(current_bgsfx)
-                        needed_duration = len(pause_dur)
+                        needed_duration = len(base_pause)
                         start_ms = bgsfx_offset % bgsfx_len
-                        
                         bgsfx_slice = AudioSegment.empty()
                         current_pos = 0
                         while current_pos < needed_duration:
@@ -4678,12 +4901,29 @@ def tts_tester_page():
                             bgsfx_slice += current_bgsfx[start_ms : start_ms + take]
                             current_pos += take
                             start_ms = 0
-                        
                         bgsfx_slice = bgsfx_slice - 28
-                        combined += bgsfx_slice
-                    else:
-                        combined += pause_dur
-                    bgsfx_offset += len(pause_dur)
+                        base_pause = base_pause.overlay(bgsfx_slice)
+                    
+                    if current_bgmusic_path:
+                        try:
+                            cmd = [
+                                'ffmpeg', '-y', '-stream_loop', '-1',
+                                '-ss', f'{current_bgmusic_offset/1000:.3f}',
+                                '-t', f'{len(base_pause)/1000:.3f}',
+                                '-i', current_bgmusic_path,
+                                '-af', 'volume=-30dB',
+                                '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', '-f', 'wav', '-'
+                            ]
+                            proc = subprocess.run(cmd, capture_output=True, timeout=10)
+                            if proc.returncode == 0:
+                                music_slice = AudioSegment.from_file(io.BytesIO(proc.stdout))
+                                base_pause = base_pause.overlay(music_slice)
+                        except Exception as e:
+                            st.warning(f"[bgmusic] Slice error during pause: {e}")
+                    
+                    combined += base_pause
+                    bgsfx_offset += len(base_pause)
+                    current_bgmusic_offset += len(base_pause)
             
             # Export
             prog_bar.progress(0.95)

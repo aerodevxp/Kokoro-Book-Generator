@@ -24,6 +24,7 @@ Then open your browser to the Streamlit URL shown in the terminal.
 - An **LLM API endpoint** (OpenAI-compatible, e.g. llama.cpp, vLLM, Ollama)
 - A **Kokoro TTS endpoint** (OpenAI-compatible `/audio/speech` endpoint)
 - An **Image generation API endpoint** (OpenAI-compatible `/images/generations`)
+- Max 1GB of available RAM for TTS editing. (Only needed when starting a generation)
 
 ### Python Dependencies
 
