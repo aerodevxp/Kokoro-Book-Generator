@@ -486,7 +486,8 @@ im_ Italian – Male
 pf_ Brazilian Portuguese – Female
 pm_ Brazilian Portuguese – Male
 
-Ensure the language used matched the prefix. If a character with an English voice speaks French (and they're a native speaker), temporarily change to a French voice of the same gender for the French part.
+Ensure the language used matched the prefix. If a character with an English voice speaks French (and they're a native speaker), temporarily change to a French voice of the same gender for the French part. 
+NEVER EVER USE AN INCORRECT TTS LANGUAGE FOR THE TEXT LANGUAGE.
 
 SOUND EFFECTS and MIXING (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
 - Use [sfx:effect_name] to insert a sound effect that interrupts speech.
