@@ -51,6 +51,7 @@ IMG_URL = os.getenv("IMG_URL")
 FREESOUND_API_KEY = os.getenv("FREESOUND_API_KEY", "")
 
 BASE_PROMPT_PATH = os.getenv("BASE_PROMPT_PATH")
+SUBPROMPTS_DIR = os.getenv("SUBPROMPTS_DIR", os.path.join(os.path.dirname(BASE_PROMPT_PATH or ""), "subprompts"))
 OUTPUT_DIR = os.getenv("OUTPUT_DIR")
 WORLDBOOK_DIR = os.getenv("WORLDBOOK_DIR", os.path.join(OUTPUT_DIR, "worldbooks"))
 SERIES_DIR = os.getenv("SERIES_DIR", os.path.join(OUTPUT_DIR, "series"))
@@ -197,7 +198,7 @@ def read_base_prompt():
 
 def ensure_directories():
     dirs = [OUTPUT_DIR, WORLDBOOK_DIR, SERIES_DIR, JOBS_DIR, SFX_DIR, CUSTOM_SFX_DIR, 
-        os.path.join(SFX_DIR, "bgsfx"), BGMUSIC_DIR]
+        os.path.join(SFX_DIR, "bgsfx"), BGMUSIC_DIR, SUBPROMPTS_DIR]
     for directory in dirs:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
@@ -487,7 +488,7 @@ pf_ Brazilian Portuguese – Female
 pm_ Brazilian Portuguese – Male
 
 Ensure the language used matched the prefix. If a character with an English voice speaks French (and they're a native speaker), temporarily change to a French voice of the same gender for the French part. 
-NEVER EVER USE AN INCORRECT TTS LANGUAGE FOR THE TEXT LANGUAGE.
+NEVER EVER USE AN INCORRECT TTS LANGUAGE FOR THE TEXT LANGUAGE. If there's no voice/gender pair available (like French male for example), make sure to include an English translation.
 
 SOUND EFFECTS and MIXING (CRITICAL - YOU MUST USE THESE FOR IMMERSION):
 - Use [sfx:effect_name] to insert a sound effect that interrupts speech.
@@ -586,6 +587,35 @@ def load_features():
             f.write('\n'.join(default_features))
         features = default_features
     return features
+    
+def get_subprompts():
+    """Get list of available subprompt files"""
+    subprompts_dir = Path(SUBPROMPTS_DIR)
+    if not subprompts_dir.exists():
+        return []
+    return sorted(list(subprompts_dir.glob("*.txt")))
+
+def load_subprompt_content(name):
+    """Load a single subprompt's content"""
+    subprompts_dir = Path(SUBPROMPTS_DIR)
+    path = subprompts_dir / f"{name}.txt"
+    if path.exists():
+        with open(path, 'r') as f:
+            return f.read().strip()
+    return ""
+
+def load_selected_subprompts(selected_names):
+    """Load and concatenate selected subprompts into a single string"""
+    if not selected_names:
+        return ""
+    combined = ""
+    for name in selected_names:
+        content = load_subprompt_content(name)
+        if content:
+            combined += f"\n--- {name} ---\n{content}\n"
+    if combined:
+        return f"\nADDITIONAL INSTRUCTIONS:\n{combined}\n"
+    return ""
 
 def prepare_bgsfx(audio_segment, max_duration_ms=180000, fade_ms=1000):
     """Trim BGSFX to max_duration and apply fade in/out for smooth loops.
@@ -995,24 +1025,97 @@ def save_sfx_cache(cache):
     with open(SFX_CACHE_FILE, 'w') as f:
         json.dump(cache, f, indent=2)
 
-def string_to_pdf(string, outputFullPath):
+def string_to_pdf_colored(raw_text, output_path):
+    """Generate PDF with colored dialogue and asterisk text.
+    
+    Dialogue (voice tag content starting with quotes) → Dark blue
+    Asterisk text (*text*) → Brown  
+    Normal narration → Dark gray
+    """
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=72)
     pdf.add_font("DejaVu", "", "./assets/DejaVuSans.ttf", uni=True)
     pdf.set_font("DejaVu", size=12)
-    pdf.set_text_color(34, 34, 34)
     
-    paragraphs = [p.strip() for p in string.split('\n\n') if p.strip()]
+    COLOR_NORMAL = (34, 34, 34)
+    COLOR_DIALOGUE = (0, 0, 139)    # Dark blue
+    COLOR_ASTERISK = (139, 69, 19)  # Brown
+    
+    # Remove control tokens and SFX but KEEP voice tags for dialogue detection
+    text = raw_text
+    text = PAUSE_PATTERN.sub('', text)
+    text = RATE_PATTERN.sub('', text)
+    text = IPA_PATTERN.sub(r'\1', text)
+    text = re.sub(r'\x5Bsfx:[^\x5D]+\x5D', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\x5B/?bgsfx(?::[^\x5D]*)?\x5D', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\x5B/?bgmusic(?::[^\x5D]*)?\x5D', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'$$END$$', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'  +', ' ', text)
+    
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     if not paragraphs:
-        paragraphs = [string]
+        paragraphs = [text]
+    # Replace single newlines within paragraphs with spaces
+    paragraphs = [p.replace('\n', ' ') for p in paragraphs]
+    
+    voice_pattern = re.compile(r'<([^>]+)>([^<]*)</\1>', re.DOTALL)
+    asterisk_pattern = re.compile(r'\*{1,3}([^*]+)\*{1,3}')
+    
+    def split_by_asterisks(text, default_color):
+        """Split text by asterisk patterns, returning list of (text, color) tuples."""
+        if not text:
+            return []
+        result = []
+        pos = 0
+        for match in asterisk_pattern.finditer(text):
+            if match.start() > pos:
+                result.append((text[pos:match.start()], default_color))
+            # Asterisk content without the asterisks themselves
+            result.append((match.group(1), COLOR_ASTERISK))
+            pos = match.end()
+        if pos < len(text):
+            result.append((text[pos:], default_color))
+        return result
     
     for i, para in enumerate(paragraphs):
-        pdf.multi_cell(0, 10, para)
+        segments = []  # List of (text, color) tuples
+        pos = 0
+        
+        while pos < len(para):
+            voice_match = voice_pattern.match(para, pos)
+            if voice_match:
+                content = voice_match.group(2)
+                stripped = content.lstrip()
+                # Dialogue if starts with a quote character
+                if stripped and stripped[0] in '""\'\'':
+                    segments.append((content, COLOR_DIALOGUE))
+                else:
+                    # Narration — check for asterisks within
+                    segments.extend(split_by_asterisks(content, COLOR_NORMAL))
+                pos = voice_match.end()
+            else:
+                # Find next voice tag
+                next_voice = voice_pattern.search(para, pos)
+                if next_voice:
+                    between = para[pos:next_voice.start()]
+                    segments.extend(split_by_asterisks(between, COLOR_NORMAL))
+                    pos = next_voice.start()
+                else:
+                    rest = para[pos:]
+                    segments.extend(split_by_asterisks(rest, COLOR_NORMAL))
+                    pos = len(para)
+        
+        # Write segments to PDF inline
+        for text_seg, color in segments:
+            if text_seg:
+                pdf.set_text_color(*color)
+                pdf.write(10, text_seg)
+        
         if i < len(paragraphs) - 1:
             pdf.ln(6)
     
-    pdf.output(outputFullPath)
+    pdf.output(output_path)
  
 def generate_chapter_summary(chapter_text, chapter_num, total_chapters=None, topic="", job_id=None):
     clean_text = remove_voice_tags(chapter_text)
@@ -1040,7 +1143,7 @@ Chapter summary (600 words max):"""
     response = llm_client.chat.completions.create(
         model=STORY_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=250,
+        max_tokens=600,
         temperature=0.3
     )
     
@@ -1052,7 +1155,7 @@ def build_running_summary(chapter_summaries):
         return ""
     
     combined = "\n\n".join([f"Chapter {i+1}: {summary}" for i, summary in enumerate(chapter_summaries)])
-    return f"STORY SO FAR (summaries of previous chapters):\n{combined}\n\n"
+    return f"STORY SO FAR (summaries of previous chapters):\n{combined}\n\nIMPORTANT: The above summaries may mention resolved events. The core conflict of the story is NOT yet resolved. Continue building tension and do not wrap up the story prematurely.\n"
 
 def get_all_stories():
     story_files = []
@@ -1246,12 +1349,14 @@ def save_story(story, title, series_name=None):
     story_dir = base_dir / safe_title
     story_dir.mkdir(parents=True, exist_ok=True)
     
+    # TXT gets cleaned text (no voice tags, no SFX)
     clean_story = remove_voice_tags(story)
     filepath = story_dir / f"{safe_title}.txt"
     with open(filepath, 'w') as f:
         f.write(clean_story)
     
-    string_to_pdf(clean_story, str(story_dir / f"{safe_title}.pdf"))
+    # PDF gets RAW text (with voice tags) so it can color dialogue
+    string_to_pdf_colored(story, str(story_dir / f"{safe_title}.pdf"))
     return filepath, story_dir
 
 def save_tts_story(story, title, story_dir):
@@ -1935,8 +2040,8 @@ def stream_llm_with_retry(prompt, model, max_tokens, temperature, max_retries=3)
             else:
                 raise e
 
-def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False, custom_title="", time_period=""):
-    cleanup_old_jobs(keep_last=3)
+def run_generation_worker(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test=False, custom_title="", time_period="", selected_subprompts=None):
+    cleanup_old_jobs(keep_last=5)
     try:
         def check_cancel():
             if is_cancel_requested(job_id):
@@ -1964,7 +2069,8 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
             "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
             "features": features, "length_instruction": length_instruction,
             "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
-            "custom_title": custom_title, "time_period": time_period
+            "custom_title": custom_title, "time_period": time_period,
+            "selected_subprompts": selected_subprompts or []
         }
         update_job_status(job_id, "running", 0, "Starting generation...", job_type="story", params=params)
         base_prompt = read_base_prompt()
@@ -1977,7 +2083,9 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
         
         available_sfx_interrupting, available_sfx_bgsfx, available_bgmusic = get_available_sfx()
 
-        voice_instruction = build_voice_instruction(character_voices if character_voices else None, available_sfx_interrupting, available_sfx_bgsfx)
+        voice_instruction = build_voice_instruction(character_voices if character_voices else None, available_sfx_interrupting, available_sfx_bgsfx, available_bgmusic)
+
+        subprompt_content = load_selected_subprompts(selected_subprompts)
 
         story_context = load_story_context(reference_story, job_id)
         worldbook_context = load_worldbook_context(worldbook_path)
@@ -2011,7 +2119,7 @@ def run_generation_worker(job_id, topic, genre, story_type, reference_story, ser
                 time_instruction = f"\nTime Period: This story takes place around {time_period}. Keep this setting consistent.\n"
             
             prompt = f"""{base_prompt}
-{worldbook_context}{story_context}{voice_instruction}{time_instruction}
+{worldbook_context}{story_context}{voice_instruction}{time_instruction}{subprompt_content}
 Generate a detailed story outline.
 Topic: {topic if topic else 'a compelling story of your choice'}
 Genre: {genre if genre else 'AI decides'}
@@ -2031,7 +2139,7 @@ List each chapter with a brief description."""
             if check_cancel(): return
             response = llm_client.chat.completions.create(
                 model=STORY_MODEL, messages=[{"role": "user", "content": prompt}],
-                max_tokens=1500, temperature=0.8, stream=True
+                max_tokens=10000, temperature=0.8, stream=True
             )
             
             outline = ""
@@ -2048,7 +2156,7 @@ List each chapter with a brief description."""
                 
                 response = llm_client.chat.completions.create(
                     model=STORY_MODEL, messages=[{"role": "user", "content": prompt}],
-                    max_tokens=1500, temperature=0.8, stream=True
+                    max_tokens=10000, temperature=0.8, stream=True
                 )
                 
                 outline = ""
@@ -2099,7 +2207,7 @@ Synopsis (no spoilers, 2-3 sentences):"""
                 
                 synopsis_response = llm_client.chat.completions.create(
                     model=STORY_MODEL, messages=[{"role": "user", "content": synopsis_prompt}],
-                    max_tokens=100, temperature=0.5
+                    max_tokens=300, temperature=0.5
                 )
                 synopsis = synopsis_response.choices[0].message.content.strip()
                 log.info(f"Synopsis generated: {synopsis[:100]}...")
@@ -2143,23 +2251,29 @@ Synopsis (no spoilers, 2-3 sentences):"""
                 if chapter_num == 1:
                     ch_prompt = f"""{base_prompt}
                 {worldbook_context}{story_context}{voice_instruction}
+                {subprompt_content}
                 {premise_anchor}
                 Based on this outline:
                 {outline}
                 Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above.
+                - ALWAYS use quotation marks for spoken dialogue. Example: <af_heart>"Hello there," she said.</af_heart>
+                - NEVER write dialogue without quotes, even inside voice tags.
                 Start the story properly - establish the setting, introduce the main characters, and set the core conflict in motion. DO NOT resolve anything yet."""
                 else:
                     ch_prompt = f"""{base_prompt}
                 {worldbook_context}{story_context}{voice_instruction}
+                {subprompt_content}
                 {premise_anchor}
                 {running_summary}
                 Continue the story logically from the summaries above.
                 Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above.
+                - ALWAYS use quotation marks for spoken dialogue. Example: <af_heart>"Hello there," she said.</af_heart>
+                - NEVER write dialogue without quotes, even inside voice tags.
                 Remember: This is a multi-chapter story. Progress the plot incrementally. Do NOT rush to resolve conflicts. Each chapter should ADD complications, depth, or new developments - not wrap things up early."""
                 
                 update_job_status(job_id, "running", chapter_progress, f"Phase 2: Requesting Chapter {chapter_num}/{total_chapters} from AI...")
                 log.info(f"Requesting Chapter {chapter_num}/{total_chapters}")
-                response = stream_llm_with_retry(prompt=ch_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.8)
+                response = stream_llm_with_retry(prompt=ch_prompt, model=STORY_MODEL, max_tokens=10000, temperature=0.8)
                 
                 chapter = ""
                 ch_tokens = 0
@@ -2208,7 +2322,7 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
 
                 Write Chapter {chapter_num} again, fixing all voice tag issues. End with [END]"""
                     
-                    response = stream_llm_with_retry(prompt=fix_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.7)
+                    response = stream_llm_with_retry(prompt=fix_prompt, model=STORY_MODEL, max_tokens=10000, temperature=0.7)
                     chapter = ""
                     ch_tokens = 0
                     for chunk in response:
@@ -2279,7 +2393,8 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
             "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
             "features": features, "length_instruction": length_instruction,
             "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
-            "custom_title": custom_title, "time_period": time_period
+            "custom_title": custom_title, "time_period": time_period,
+            "selected_subprompts": selected_subprompts or []
         }
         save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=regen_params)
         log.info(f"Metadata saved. Voices used: {voices_used}")
@@ -2328,7 +2443,7 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
         update_job_status(job_id, "error", 0, str(e))
 
 
-def run_story_continuation_worker(job_id, outline, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test, custom_title, time_period):
+def run_story_continuation_worker(job_id, outline, topic, genre, story_type, reference_story, series_name, worldbook_path, features, length_instruction, want_tts, debug_mode, quick_test, custom_title, time_period, selected_subprompts=None):
     """Continue story generation after outline approval."""
     try:
         def check_cancel():
@@ -2346,10 +2461,12 @@ def run_story_continuation_worker(job_id, outline, topic, genre, story_type, ref
             "features": features, "length_instruction": length_instruction,
             "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
             "custom_title": custom_title, "time_period": time_period,
-            "outline": outline  # Save outline so retry can skip regenerating it
+            "outline": outline,
+            "selected_subprompts": selected_subprompts or []
         }
         
         base_prompt = read_base_prompt()
+        subprompt_content = load_selected_subprompts(selected_subprompts)
         
         character_voices = {}
         if worldbook_path:
@@ -2358,7 +2475,8 @@ def run_story_continuation_worker(job_id, outline, topic, genre, story_type, ref
             character_voices = extract_character_voices(wb_content)
         
         available_sfx_interrupting, available_sfx_bgsfx, available_bgmusic = get_available_sfx()
-        voice_instruction = build_voice_instruction(character_voices if character_voices else None, available_sfx_interrupting, available_sfx_bgsfx)
+        voice_instruction = build_voice_instruction(character_voices if character_voices else None, available_sfx_interrupting, available_sfx_bgsfx, available_bgmusic)
+        log.info(f"Voice Instructions: {voice_instruction}")
         story_context = load_story_context(reference_story, job_id)
         worldbook_context = load_worldbook_context(worldbook_path)
         
@@ -2397,23 +2515,29 @@ def run_story_continuation_worker(job_id, outline, topic, genre, story_type, ref
                 ch_prompt = f"""{base_prompt}
             {worldbook_context}{story_context}{voice_instruction}
             {premise_anchor}
+            {subprompt_content}
             Based on this outline:
             {outline}
             Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above.
+            - ALWAYS use quotation marks for spoken dialogue. Example: <af_heart>"Hello there," she said.</af_heart>
+            - NEVER write dialogue without quotes, even inside voice tags.
             Start the story properly - establish the setting, introduce the main characters, and set the core conflict in motion. DO NOT resolve anything yet."""
             else:
                 ch_prompt = f"""{base_prompt}
             {worldbook_context}{story_context}{voice_instruction}
             {premise_anchor}
+            {subprompt_content}
             {running_summary}
             Continue the story logically from the summaries above.
+            - ALWAYS use quotation marks for spoken dialogue. Example: <af_heart>"Hello there," she said.</af_heart>
+            - NEVER write dialogue without quotes, even inside voice tags.
             Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice tags as described in the voice instructions above.
             Remember: This is a multi-chapter story. Progress the plot incrementally. Do NOT rush to resolve conflicts. Each chapter should ADD complications, depth, or new developments - not wrap things up early."""
             ch_prompt += " End this chapter with [END]"
             
             update_job_status(job_id, "running", chapter_progress, f"Phase 2: Requesting Chapter {chapter_num}/{total_chapters} from AI...")
             log.info(f"Requesting Chapter {chapter_num}/{total_chapters}")
-            response = stream_llm_with_retry(prompt=ch_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.8)
+            response = stream_llm_with_retry(prompt=ch_prompt, model=STORY_MODEL, max_tokens=10000, temperature=0.8)
             
             chapter = ""
             ch_tokens = 0
@@ -2462,7 +2586,7 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
 
             Write Chapter {chapter_num} again, fixing all voice tag issues. End with [END]"""
                 
-                response = stream_llm_with_retry(prompt=fix_prompt, model=STORY_MODEL, max_tokens=2048, temperature=0.7)
+                response = stream_llm_with_retry(prompt=fix_prompt, model=STORY_MODEL, max_tokens=10000, temperature=0.7)
                 chapter = ""
                 ch_tokens = 0
                 for chunk in response:
@@ -2532,7 +2656,8 @@ Write Chapter {chapter_num} in detail. Wrap ALL dialogue AND narration in voice 
             "series_name": series_name, "worldbook_path": str(worldbook_path) if worldbook_path else None,
             "features": features, "length_instruction": length_instruction,
             "want_tts": want_tts, "debug_mode": debug_mode, "quick_test": quick_test,
-            "custom_title": custom_title, "time_period": time_period
+            "custom_title": custom_title, "time_period": time_period,
+            "selected_subprompts": selected_subprompts or []
         }
         save_metadata(title, story_type, reference_story, worldbook_path, features, story_dir, voices_used, time_period=time_period, generation_params=regen_params)
         log.info(f"Metadata saved. Voices used: {voices_used}")
@@ -3341,7 +3466,7 @@ def generate_cover_image(title, story_summary, story_dir, job_id=None):
     if job_id:
         update_job_status(job_id, "running", 0.95, "Generating cover art...")
     
-    prompt = f"Book cover art for a story titled '{title}'. Style: atmospheric, cinematic, poster. Do not write any text. Use symbols and abstract shapes to convey a meaning. Story summary: {story_summary[:300]}"
+    prompt = f"Art for an art piece named '{title}'. Do not write any text. Use symbols and abstract shapes to convey a meaning. Small art piece summary: {story_summary[:300]}"
     
     try:
         response = requests.post(
@@ -3400,7 +3525,7 @@ Final book summary (1000 words max):"""
     response = llm_client.chat.completions.create(
         model=STORY_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=800,
+        max_tokens=1000,
         temperature=0.3
     )
     
@@ -3487,7 +3612,7 @@ def main():
                 st.caption(f"Job ID: `{job_id}`")
                 st.divider()
 
-    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Clean Existing Story", "TTS Tester", "Timeline View", "Convert to M4B"]
+    menu = ["Generate New Story", "Job Status", "Generate TTS for Existing", "Story Library", "Series Manager", "Worldbook Manager", "Feature Manager", "Subprompts Manager", "Clean Existing Story", "TTS Tester", "Timeline View", "Convert to M4B"]
     choice = st.sidebar.selectbox("Menu", menu)
 
     if choice == "Generate New Story":
@@ -3506,6 +3631,8 @@ def main():
         timeline_view_page()
     elif choice == "Feature Manager":
         feature_manager_page()
+    elif choice == "Subprompts Manager":
+        subprompts_manager_page()
     elif choice == "Clean Existing Story":
         clean_existing_story_page()
     elif choice == "TTS Tester":
@@ -3544,6 +3671,7 @@ def generate_new_story_page():
     
     if current_job_id:
         job = get_job_status(current_job_id)
+        job_id = current_job_id
         if job:
             if job['status'] == 'awaiting_approval':
                 st.info("📋 **Outline generated! Please review the synopsis:**")
@@ -3570,7 +3698,7 @@ def generate_new_story_page():
                                       params.get('features', []), params.get('length_instruction'), 
                                       params.get('want_tts', True), params.get('debug_mode', False), 
                                       params.get('quick_test', False), params.get('custom_title', ''),
-                                      params.get('time_period', ''))
+                                      params.get('time_period', ''), params.get('selected_subprompts', []))
                             )
                             thread.daemon = True
                             thread.start()
@@ -3641,7 +3769,7 @@ def generate_new_story_page():
                                     ref_story, params.get('series_name'), wb_path, params.get('features', []),
                                     params.get('length_instruction'), params.get('want_tts', True),
                                     params.get('debug_mode', False), params.get('quick_test', False),
-                                    params.get('custom_title', ""), params.get('time_period', ""))
+                                    params.get('custom_title', ""), params.get('time_period', ""), params.get('selected_subprompts', []))
                             )
                             thread.daemon = True
                             thread.start()
@@ -3694,7 +3822,7 @@ def generate_new_story_page():
                             args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
                                   ref_story, params.get('series_name'), wb_path, params.get('features', []), 
                                   params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False), 
-                                  params.get('custom_title', ""), params.get('time_period', ""))
+                                  params.get('custom_title', ""), params.get('time_period', ""), params.get('selected_subprompts', []))
                         )
                         thread.daemon = True
                         thread.start()
@@ -3775,6 +3903,13 @@ def generate_new_story_page():
                     for char, voice in char_voices.items():
                         st.write(f"• {char}: {voice}")
         
+        subprompts = get_subprompts()
+        if subprompts:
+            subprompt_opts = [s.stem for s in subprompts]
+            selected_subprompts = st.multiselect("Additional Instructions", subprompt_opts, key="selected_subprompts")
+        else:
+            selected_subprompts = []
+
         features = load_features()
         col_feat1, col_feat2 = st.columns([4, 1])
         with col_feat1:
@@ -3805,7 +3940,7 @@ def generate_new_story_page():
         
         thread = threading.Thread(
             target=run_generation_worker,
-            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode, quick_test, custom_title, time_period)
+            args=(job_id, topic, genre, story_type, reference_story, series_name, worldbook_path, selected_features, length_instruction, want_tts, debug_mode, quick_test, custom_title, time_period, selected_subprompts)
         ) 
         thread.daemon = True
         thread.start()
@@ -3893,7 +4028,7 @@ def job_status_page():
                                       params.get('features', []), params.get('length_instruction'), 
                                       params.get('want_tts', True), params.get('debug_mode', False), 
                                       params.get('quick_test', False), params.get('custom_title', ''),
-                                      params.get('time_period', ''))
+                                      params.get('time_period', ''),params.get('selected_subprompts', []))
                             )
                             thread.daemon = True
                             thread.start()
@@ -3954,7 +4089,7 @@ def job_status_page():
                                     ref_story, params.get('series_name'), wb_path, params.get('features', []),
                                     params.get('length_instruction'), params.get('want_tts', True),
                                     params.get('debug_mode', False), params.get('quick_test', False),
-                                    params.get('custom_title', ""), params.get('time_period', ""))
+                                    params.get('custom_title', ""), params.get('time_period', ""), params.get('selected_subprompts', []))
                             )
                             thread.daemon = True
                             thread.start()
@@ -4018,7 +4153,7 @@ def job_status_page():
                                         params.get('features', []), params.get('length_instruction'), 
                                         params.get('want_tts', True), params.get('debug_mode', False), 
                                         params.get('quick_test', False), params.get('custom_title', ''),
-                                        params.get('time_period', ''))
+                                        params.get('time_period', ''), params.get('selected_subprompts', []))
                                 )
                             else:
                                 # No outline saved, start from scratch
@@ -4028,7 +4163,7 @@ def job_status_page():
                                         ref_story, params.get('series_name'), wb_path, params.get('features', []), 
                                         params.get('length_instruction'), params.get('want_tts', True), 
                                         params.get('debug_mode', False), params.get('quick_test', False), 
-                                        params.get('custom_title', ""), params.get('time_period', ""))
+                                        params.get('custom_title', ""), params.get('time_period', ""), params.get('selected_subprompts', []))
                                 )
                             thread.daemon = True
                             thread.start()
@@ -4074,7 +4209,7 @@ def job_status_page():
                                       ref_story, params.get('series_name'), wb_path, params.get('features', []), 
                                       params.get('length_instruction'), params.get('want_tts', True), 
                                       params.get('debug_mode', False), params.get('quick_test', False), 
-                                      params.get('custom_title', ""), params.get('time_period', ""))
+                                      params.get('custom_title', ""), params.get('time_period', ""), params.get('selected_subprompts', []))
                             )
                             thread.daemon = True
                             thread.start()
@@ -4341,7 +4476,7 @@ def story_library_page():
                           wb_path, regen_params.get('features', []), regen_params.get('length_instruction'), 
                           regen_params.get('want_tts', True), regen_params.get('debug_mode', False), 
                           regen_params.get('quick_test', False), regen_params.get('custom_title', ''),
-                          regen_params.get('time_period', ''))
+                          regen_params.get('time_period', ''), params.get('selected_subprompts', []))
                 )
                 thread.daemon = True
                 thread.start()
@@ -5160,6 +5295,65 @@ def tts_tester_page():
             status_ph.error(f"❌ Error: {e}")
             prog_bar.progress(0)
 
+def subprompts_manager_page():
+    st.header("📝 Subprompts Manager")
+    st.markdown("Create and edit additional instruction files. These can be selected when generating a story to inject specific instructions into the AI's prompt.")
+    
+    tab1, tab2 = st.tabs(["Create New", "Edit Existing"])
+    
+    with tab1:
+        st.subheader("Create New Subprompt")
+        name = st.text_input("Subprompt Name (filename)", key="new_subprompt_name")
+        content = st.text_area("Subprompt Content", height=300, key="new_subprompt_content",
+                              placeholder="Enter additional instructions for the AI...\n\nExample: 'All characters must speak in formal language. Avoid modern slang.'")
+        
+        if st.button("Save Subprompt", type="primary", key="save_new_subprompt"):
+            if name and content:
+                subprompt_path = Path(SUBPROMPTS_DIR) / f"{name}.txt"
+                with open(subprompt_path, 'w') as f:
+                    f.write(content)
+                st.success(f"Subprompt saved: {subprompt_path}")
+                st.rerun()
+            else:
+                st.error("Name and content are required.")
+    
+    with tab2:
+        st.subheader("Edit Existing Subprompt")
+        subprompts = get_subprompts()
+        if not subprompts:
+            st.info("No subprompts found. Create one in the 'Create New' tab!")
+            return
+        
+        sp_opts = [s.stem for s in subprompts]
+        
+        if 'last_selected_sp' not in st.session_state:
+            st.session_state['last_selected_sp'] = None
+            
+        selected_sp = st.selectbox("Select Subprompt", sp_opts, key="edit_sp_select")
+        
+        sp_path = next(s for s in subprompts if s.stem == selected_sp)
+        with open(sp_path, 'r') as f:
+            current_content = f.read()
+        
+        if st.session_state['last_selected_sp'] != selected_sp:
+            st.session_state['edit_sp_content'] = current_content
+            st.session_state['last_selected_sp'] = selected_sp
+        
+        edited_content = st.text_area("Edit Content", height=400, key="edit_sp_content")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Update Subprompt", type="primary", key="update_sp"):
+                with open(sp_path, 'w') as f:
+                    f.write(edited_content)
+                st.success(f"Subprompt updated: {sp_path}")
+                st.rerun()
+        with col2:
+            if st.button("🗑️ Delete Subprompt", key=f"delete_sp_{selected_sp}"):
+                sp_path.unlink()
+                st.success(f"Deleted: {selected_sp}")
+                st.rerun()
+
 def clean_existing_story_page():
     st.header("🧹 Clean Existing Story (Remove Voice Tags)")
     
@@ -5199,9 +5393,15 @@ def clean_existing_story_page():
                             
                             thread = threading.Thread(
                                 target=run_generation_worker,
-                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'), 
-                                      ref_story, params.get('series_name'), wb_path, params.get('features', []), 
-                                      params.get('length_instruction'), params.get('want_tts', True), params.get('debug_mode', False), params.get('quick_test', False))
+                                args=(new_job_id, outline, params.get('topic'), params.get('genre'), 
+                                      params.get('story_type'), 
+                                      Path(params['reference_story']) if params.get('reference_story') else None,
+                                      params.get('series_name'), 
+                                      Path(params['worldbook_path']) if params.get('worldbook_path') else None,
+                                      params.get('features', []), params.get('length_instruction'), 
+                                      params.get('want_tts', True), params.get('debug_mode', False), 
+                                      params.get('quick_test', False), params.get('custom_title', ''),
+                                      params.get('time_period', ''), params.get('selected_subprompts', []))
                             )
                             thread.daemon = True
                             thread.start()
@@ -5246,7 +5446,7 @@ def clean_existing_story_page():
                                       ref_story, params.get('series_name'), wb_path, params.get('features', []), 
                                       params.get('length_instruction'), params.get('want_tts', True), 
                                       params.get('debug_mode', False), params.get('quick_test', False), 
-                                      params.get('custom_title', ""), params.get('time_period', ""))
+                                      params.get('custom_title', ""), params.get('time_period', ""), params.get('selected_subprompts', []))
                             )
                             thread.daemon = True
                             thread.start()
