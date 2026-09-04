@@ -1024,7 +1024,7 @@ def generate_chapter_summary(chapter_text, chapter_num, total_chapters=None, top
     
     topic_note = f"\nThe story's core premise is: {topic}" if topic else ""
     
-    prompt = f"""Summarize this chapter in 350 words max. Include:
+    prompt = f"""Summarize this chapter in 600 words max. Include:
 - Key events that occurred
 - Character developments or revelations
 - Important dialogue or decisions
@@ -1034,7 +1034,7 @@ def generate_chapter_summary(chapter_text, chapter_num, total_chapters=None, top
 Chapter {chapter_num}:
 {clean_text}
 
-Chapter summary (150 words max):"""
+Chapter summary (600 words max):"""
     
     response = llm_client.chat.completions.create(
         model=STORY_MODEL,
@@ -3384,7 +3384,7 @@ def generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job
     if job_id:
         update_job_status(job_id, "running", 0.88, "Generating book summary from chapter summaries...")
     
-    prompt = f"""Below are chapter summaries from a story. Combine them into ONE cohesive summary of maximum 600 words. Include:
+    prompt = f"""Below are chapter summaries from a story. Combine them into ONE cohesive summary of maximum 1000 words. Include:
 - Main characters and their relationships
 - Key plot points and events
 - Important settings/locations
@@ -3394,7 +3394,7 @@ def generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job
 Chapter summaries:
 {combined}
 
-Final book summary (600 words max):"""
+Final book summary (1000 words max):"""
     
     response = llm_client.chat.completions.create(
         model=STORY_MODEL,
