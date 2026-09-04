@@ -2625,6 +2625,68 @@ def run_m4b_convert_worker(job_id, story_path):
         log.warning(e)
         update_job_status(job_id, "error", 0, str(e), job_type="m4b_convert")
 
+def run_cover_regenerate_worker(job_id, story_path):
+    try:
+        params = {"story_path": str(story_path)}
+        update_job_status(job_id, "running", 0, "Loading story metadata...", job_type="cover_regen", params=params)
+        
+        story_dir = story_path.parent
+        stem = story_path.stem
+        
+        # Load metadata for title
+        meta_path = story_dir / f"{sanitize_title(stem)}_metadata.json"
+        title = stem
+        if meta_path.exists():
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+                title = meta.get("title", stem)
+        
+        # Load summary if it exists
+        story_summary = ""
+        summary_path = story_dir / f"{sanitize_title(stem)}_summary.txt"
+        if summary_path.exists():
+            with open(summary_path, 'r') as f:
+                story_summary = f.read()
+        
+        update_job_status(job_id, "running", 0.2, "Generating new cover art...", title=title)
+        
+        # Generate new cover (overwrites existing)
+        cover_path = generate_cover_image(title, story_summary, story_dir, job_id)
+        
+        if cover_path:
+            update_job_status(job_id, "running", 0.7, "Embedding cover in audiobook...", title=title)
+            
+            # Embed in MP3 if it exists
+            mp3_path = story_dir / f"{sanitize_title(stem)}_audiobook.mp3"
+            if mp3_path.exists():
+                embed_cover_in_mp3(str(mp3_path), str(cover_path), title)
+            
+            # Embed in M4B if it exists
+            m4b_path = story_dir / f"{sanitize_title(stem)}_audiobook.m4b"
+            if m4b_path.exists():
+                embed_cover_in_m4b(str(m4b_path), str(cover_path), title)
+            
+            update_job_status(job_id, "completed", 1.0, "Cover regenerated successfully!", [str(cover_path)], title, job_type="cover_regen")
+        else:
+            # Read the last few log lines to find the actual error
+            error_detail = "Cover generation failed (check generator.log for details)"
+            try:
+                log_file = os.path.join(OUTPUT_DIR, "generator.log")
+                if os.path.exists(log_file):
+                    with open(log_file, 'r') as f:
+                        lines = f.readlines()
+                        # Find the last ERROR line
+                        for line in reversed(lines):
+                            if '[ERROR]' in line and 'Cover' in line:
+                                error_detail = line.split('] ', 1)[-1].strip() if '] ' in line else line.strip()
+                                break
+            except:
+                pass
+            update_job_status(job_id, "error", 0, error_detail, title=title, job_type="cover_regen")
+    except Exception as e:
+        log.error(f"[ERROR] Cover regen worker failed: {e}", exc_info=True)
+        update_job_status(job_id, "error", 0, str(e), job_type="cover_regen")
+
 def run_clean_worker(job_id, story_path):
     try:
         params = {"story_path": str(story_path)}
@@ -3296,14 +3358,22 @@ def generate_cover_image(title, story_summary, story_dir, job_id=None):
         
         if response.status_code == 200:
             import base64
-            image_data = base64.b64decode(response.json()['data'][0]['b64_json'])
-            cover_path = story_dir / f"{sanitize_title(title)}_cover.png"
-            with open(cover_path, 'wb') as f:
-                f.write(image_data)
-            return cover_path
+            resp_json = response.json()
+            if 'data' in resp_json and len(resp_json['data']) > 0 and 'b64_json' in resp_json['data'][0]:
+                image_data = base64.b64decode(resp_json['data'][0]['b64_json'])
+                cover_path = story_dir / f"{sanitize_title(title)}_cover.png"
+                with open(cover_path, 'wb') as f:
+                    f.write(image_data)
+                return cover_path
+            else:
+                log.error(f"[ERROR] Cover API returned 200 but unexpected JSON: {str(resp_json)[:300]}")
+                return None
+        else:
+            log.error(f"[ERROR] Cover API returned {response.status_code}: {response.text[:300]}")
+            return None
     except Exception as e:
-        log.warning(f"[ERROR] Cover generation failed: {e}")
-    return None
+        log.error(f"[ERROR] Cover generation failed: {e}", exc_info=True)
+        return None
 
 def generate_book_summary_from_chapters(chapter_summaries, title, story_dir, job_id=None):
     if not chapter_summaries:
@@ -3533,26 +3603,79 @@ def generate_new_story_page():
                 st.rerun()
             
             elif job['status'] == 'completed':
-                st.success(f"✅ **Last Job Complete!** {job['message']}")
-                if job.get('files'):
-                    st.write("**Generated files:**")
-                    for file_path in job['files']:
-                        p = Path(file_path)
-                        if p.exists():
-                            if p.suffix == '.txt':
-                                with open(p, 'rb') as f:
-                                    st.download_button(f"Download {p.name}", f, file_name=p.name)
-                            elif p.suffix == '.pdf':
-                                with open(p, 'rb') as f:
-                                    st.download_button(f"Download {p.name}", f, file_name=p.name, mime='application/pdf')
-                            elif p.suffix == '.mp3':
-                                with open(p, 'rb') as f:
-                                    st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg')
-                if st.button("Clear and Start New"):
-                    delete_job(current_job_id)
-                    del st.session_state['current_job_id']
-                    st.rerun()
-                return
+                st.success("✅ Generation Complete!")
+                for file_path in job.get('files', []):
+                    p = Path(file_path)
+                    if p.exists():
+                        if p.suffix == '.txt':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.pdf':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='application/pdf', key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.mp3':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg', key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.m4b':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mp4', key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.png':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='image/png', key=f"dl_{job_id}_{p.name}")
+                
+                # Regen options for story jobs
+                if job_type == 'story':
+                    col_regen, col_cover, col_clear = st.columns(3)
+                    with col_regen:
+                        if st.button(f"🔄 Regen Story", key=f"regen_story_{job_id}"):
+                            params = job.get('params') or {}
+                            new_job_id = str(int(time.time()))
+                            
+                            ref_story = Path(params['reference_story']) if params.get('reference_story') else None
+                            wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
+                            
+                            thread = threading.Thread(
+                                target=run_generation_worker,
+                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'),
+                                    ref_story, params.get('series_name'), wb_path, params.get('features', []),
+                                    params.get('length_instruction'), params.get('want_tts', True),
+                                    params.get('debug_mode', False), params.get('quick_test', False),
+                                    params.get('custom_title', ""), params.get('time_period', ""))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_job_id'] = new_job_id
+                            st.success(f"✅ Regeneration started as {new_job_id}")
+                            time.sleep(2)
+                            st.rerun()
+                    with col_cover:
+                        # Find story txt from files
+                        story_file = None
+                        for f in job.get('files', []):
+                            p = Path(f)
+                            if p.suffix == '.txt' and not p.name.endswith('_tts.txt') and not p.name.endswith('_metadata.json') and not p.name.endswith('_cleaned.txt'):
+                                story_file = p
+                                break
+                        
+                        if story_file and st.button(f"🎨 Regen Cover", key=f"regen_cover_{job_id}"):
+                            new_job_id = f"cover_{int(time.time())}"
+                            thread = threading.Thread(
+                                target=run_cover_regenerate_worker,
+                                args=(new_job_id, story_file)
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.success(f"✅ Cover regeneration started as {new_job_id}")
+                            time.sleep(2)
+                            st.rerun()
+                    with col_clear:
+                        if st.button(f"Clear Job", key=f"clear_{job_id}"):
+                            delete_job(job_id)
+                            st.rerun()
+                else:
+                    if st.button(f"Clear Job", key=f"clear_{job_id}"):
+                        delete_job(job_id)
+                        st.rerun()
             
             elif job['status'] == 'error':
                 st.error(f"❌ **Last Job Failed:** {job['message']}")
@@ -3806,13 +3929,67 @@ def job_status_page():
                         elif p.suffix == '.mp3':
                             with open(p, 'rb') as f:
                                 st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mpeg', key=f"dl_{job_id}_{p.name}")
+                        elif p.suffix == '.m4b':
+                            with open(p, 'rb') as f:
+                                st.download_button(f"Download {p.name}", f, file_name=p.name, mime='audio/mp4', key=f"dl_{job_id}_{p.name}")
                         elif p.suffix == '.png':
                             with open(p, 'rb') as f:
                                 st.download_button(f"Download {p.name}", f, file_name=p.name, mime='image/png', key=f"dl_{job_id}_{p.name}")
                 
-                if st.button(f"Clear Job", key=f"clear_{job_id}"):
-                    delete_job(job_id)
-                    st.rerun()
+                if job_type == 'story':
+                    col_regen, col_cover, col_clear = st.columns(3)
+                    
+                    with col_regen:
+                        if st.button(f"🔄 Regen Story", key=f"regen_story_{job_id}"):
+                            params = job.get('params') or {}
+                            new_job_id = str(int(time.time()))
+                            
+                            ref_story = Path(params['reference_story']) if params.get('reference_story') else None
+                            wb_path = Path(params['worldbook_path']) if params.get('worldbook_path') else None
+                            
+                            thread = threading.Thread(
+                                target=run_generation_worker,
+                                args=(new_job_id, params.get('topic'), params.get('genre'), params.get('story_type'),
+                                    ref_story, params.get('series_name'), wb_path, params.get('features', []),
+                                    params.get('length_instruction'), params.get('want_tts', True),
+                                    params.get('debug_mode', False), params.get('quick_test', False),
+                                    params.get('custom_title', ""), params.get('time_period', ""))
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.session_state['current_job_id'] = new_job_id
+                            st.success(f"✅ Regeneration started as {new_job_id}")
+                            time.sleep(2)
+                            st.rerun()
+                    
+                    with col_cover:
+                        story_file = None
+                        for f in job.get('files', []):
+                            p = Path(f)
+                            if p.suffix == '.txt' and not p.name.endswith('_tts.txt') and not p.name.endswith('_metadata.json') and not p.name.endswith('_cleaned.txt'):
+                                story_file = p
+                                break
+                        
+                        if story_file and st.button(f"🎨 Regen Cover", key=f"regen_cover_{job_id}"):
+                            new_job_id = f"cover_{int(time.time())}"
+                            thread = threading.Thread(
+                                target=run_cover_regenerate_worker,
+                                args=(new_job_id, story_file)
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            st.success(f"✅ Cover regeneration started as {new_job_id}")
+                            time.sleep(2)
+                            st.rerun()
+                    
+                    with col_clear:
+                        if st.button(f"Clear Job", key=f"clear_{job_id}"):
+                            delete_job(job_id)
+                            st.rerun()
+                else:
+                    if st.button(f"Clear Job", key=f"clear_{job_id}"):
+                        delete_job(job_id)
+                        st.rerun()
             elif job['status'] == 'error':
                 st.error(f"❌ Error: {job['message']}")
                 
@@ -3880,6 +4057,7 @@ def job_status_page():
                         st.success(f"✅ Retrying job as {new_job_id}")
                         time.sleep(2)
                         st.rerun()
+            
                 with col_regen:
                     if st.button(f"🔄 Regen Fresh", key=f"regen_fresh_{job_id}"):
                         params = job.get('params', {})
@@ -3910,7 +4088,7 @@ def job_status_page():
                     if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
                         delete_job(job_id)
                         st.rerun()
-                return
+            
 
 
 def generate_tts_existing_page():
@@ -4212,6 +4390,32 @@ def story_library_page():
             st.success(f"✅ Summary generation started in background! Job ID: {job_id}")
             time.sleep(2)
             st.rerun()
+    
+    # Cover art section
+    cover_path = selected_file.parent / f"{sanitize_title(selected_file.stem)}_cover.png"
+    if cover_path.exists():
+        st.subheader("🎨 Cover Art")
+        st.image(str(cover_path), width=300)
+    
+    if st.button("🎨 Regenerate Cover Art", type="secondary"):
+        job_id = f"cover_{int(time.time())}"
+        thread = threading.Thread(
+            target=run_cover_regenerate_worker,
+            args=(job_id, selected_file)
+        )
+        thread.daemon = True
+        thread.start()
+        st.success(f"✅ Cover regeneration started! Job ID: {job_id}")
+        time.sleep(2)
+        st.rerun()
+    
+    audiobook_path = selected_file.parent / f"{selected_file.stem}_audiobook.mp3"
+    if audiobook_path.exists():
+        st.subheader("🎙️ Audiobook")
+        st.audio(str(audiobook_path))
+        
+        with open(audiobook_path, "rb") as f:
+            st.download_button("Download Audiobook", f, file_name=f"{selected_file.stem}_audiobook.mp3", mime="audio/mpeg")
     
     audiobook_path = selected_file.parent / f"{selected_file.stem}_audiobook.mp3"
     if audiobook_path.exists():
@@ -5056,7 +5260,7 @@ def clean_existing_story_page():
                     if st.button(f"Clear Failed Job", key=f"clear_err_{job_id}"):
                         delete_job(job_id)
                         st.rerun()
-                return
+                
     
     stories = get_all_stories()
     if not stories:
